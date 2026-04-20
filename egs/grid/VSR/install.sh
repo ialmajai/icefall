@@ -39,5 +39,9 @@ pip install --editable ./
 
 conda install -y -c conda-forge dlib==19.18.0
 
+cd $ICEFALL_DIR/egs/grid/VSR
+
+python -m pip install -r grid-requirements.txt
+
 echo 'export PYTHONPATH=/data/git/icefall:$PYTHONPATH'
 echo 'Add the line above to your ~/.bashrc or conda activate hook'
