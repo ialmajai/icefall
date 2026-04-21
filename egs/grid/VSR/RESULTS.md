@@ -14,16 +14,13 @@
 
 The training command using 1 NVIDIA GeForce RTX 3080 GPU is:
 ```bash
-export CUDA_VISIBLE_DEVICES="0,1"
-# for non-streaming model training:
 ./conformer_ctc2/train.py \
   --max-duration 1400
 ```
 
 The decoding command is:
 ```bash
-export CUDA_VISIBLE_DEVICES="0"
-for m in ; do
+for m in ctc-greedy-search ctc-decoding 1best ; do
   ./conformer_ctc2/decode.py \
     --epoch 28 \
     --avg 20 \
