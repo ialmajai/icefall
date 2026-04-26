@@ -14,7 +14,8 @@ lang_dir=data/lang_phone
 lm_dir=data/lm
 
 avhubert_code_dir="/data/av_hubert"
-avhubert_ckpt=/data/git/av_hubert/avhubert/checkpoints/lrs3_vox/clean-pretrain/base_vox_iter5.pt
+# Pre-trained base AvHubert checkpoint (no fine-tuning)
+avhubert_ckpt=avhubert-ckpts/base_vox_iter5.pt
 feats_dir=data/avhubert
 
 . shared/parse_options.sh || exit 1
@@ -62,6 +63,10 @@ fi
 
 if [ $stage -le 3 ] && [ $stop_stage -ge 3 ]; then
   log "Stage 2: Compute avhubert for grid"
+  if [ ! -f "$avhubert_ckpt" ]; then
+    log "Downloading AvHubert checkpoint"
+    wget https://dl.fbaipublicfiles.com/avhubert/model/lrs3/clean-pretrain/base_lrs3_iter5.pt -O $avhubert_ckpt
+  fi
   mkdir -p data/avhubert
 
   ./local/compute_avhubert_grid.py --avhubert-code-dir ${avhubert_code_dir} \
@@ -69,32 +74,12 @@ if [ $stage -le 3 ] && [ $stop_stage -ge 3 ]; then
 fi
 
 if [ $stage -le 4 ] && [ $stop_stage -ge 4 ]; then
-  #log "Stage 6: Prepare lang"
-  #lang_dir=data/lang
-  #mkdir -p $lang_dir 
   zcat data/manifests/grid_supervisions_train.jsonl.gz | jq -r .text \
 	 | sed 's: sp : :g'  > data/lm/train_sentences.txt
-  #cat data/lm/train_sentences.txt | grep -o -E '\w+' | sort -u  > $lang_dir/words_orig.txt
-  #python  local/prepare_words.py --lang-dir $lang_dir 
 fi
 
-vocab_size=58
 
 if [ $stage -le 5 ] && [ $stop_stage -ge 5 ]; then
-log "Stage 6: Prepare BPE based lang"
-  lang_dir=data/lang_bpe_${vocab_size}
-  mkdir -p $lang_dir
-  ./local/train_bpe_model.py \
-    --lang-dir $lang_dir \
-    --vocab-size ${vocab_size} \
-    --transcript  data/lm/train_sentences.txt 
-
-#  if [ ! -f $lang_dir/L_disambig.pt ]; then
-#    ./local/prepare_lang_bpe.py --lang-dir $lang_dir
-#  fi
-fi
-
-if [ $stage -le 6 ] && [ $stop_stage -ge 6 ]; then
   log "Stage 6: Prepare phone based lang"
   lang_dir=data/lang_phone
   mkdir -p $lang_dir
@@ -132,8 +117,35 @@ if [ $stage -le 6 ] && [ $stop_stage -ge 6 ]; then
   fi
 fi
 
+if [ $stage -le 6 ] && [ $stop_stage -ge 6 ]; then
+  log "Stage 4: Prepare G"
+  # Create FST grammar for the GRID
+  grammar_cmd="local/create_chime1_grammar.pl"
+  lang_dir=data/lang_phone
+  $grammar_cmd data/lang_phone/words.txt | fstcompile --keep_isymbols=false --keep_osymbols=false \
+   | fstarcsort --sort_type=ilabel \
+    > ${lm_dir}/G.fst || exit 1
+  fstprint  ${lm_dir}/G.fst > ${lm_dir}/G.fst.txt
+  fstprint --isymbols=$lang_dir/words.txt --osymbols=$lang_dir/words.txt ${lm_dir}/G.fst \
+   > ${lm_dir}/G.fst.words.txt
+  ./local/prepare_lang_fst.py --lang-dir $lang_dir --ngram-G ${lm_dir}/G.fst.txt
+  ./local/compile_hlg_phone.py --lang-dir $lang_dir
+fi
+
+# bpe vocab size
+vocab_size=58
 
 if [ $stage -le 7 ] && [ $stop_stage -ge 7 ]; then
+  log "Stage 6: Prepare BPE based lang"
+  lang_dir=data/lang_bpe_${vocab_size}
+  mkdir -p $lang_dir
+  ./local/train_bpe_model.py \
+    --lang-dir $lang_dir \
+    --vocab-size ${vocab_size} \
+    --transcript  data/lm/train_sentences.txt
+fi
+
+if [ $stage -le 8 ] && [ $stop_stage -ge 8 ]; then
     log "Stage 0: Prepare BPE based lexicon."
 
     lang_dir=data/lang_bpe_${vocab_size}
@@ -166,24 +178,6 @@ if [ $stage -le 7 ] && [ $stop_stage -ge 7 ]; then
         $lang_dir/L_disambig.fst
     fi
 fi
-
-
-if [ $stage -le 8 ] && [ $stop_stage -ge 8 ]; then
-  log "Stage 4: Prepare G"
-  # Create FST grammar for the GRID
-  grammar_cmd="local/create_chime1_grammar.pl"
-  lang_dir=data/lang_phone
-  $grammar_cmd data/lang_phone/words.txt | fstcompile --keep_isymbols=false --keep_osymbols=false \
-   | fstarcsort --sort_type=ilabel \
-    > ${lm_dir}/G.fst || exit 1
-  fstprint  ${lm_dir}/G.fst > ${lm_dir}/G.fst.txt
-  fstprint --isymbols=$lang_dir/words.txt --osymbols=$lang_dir/words.txt ${lm_dir}/G.fst \
-   > ${lm_dir}/G.fst.words.txt
-  ./local/prepare_lang_fst.py --lang-dir $lang_dir --ngram-G ${lm_dir}/G.fst.txt
-  ./local/compile_hlg_phone.py --lang-dir $lang_dir
-
-fi
-
 
 if [ $stage -le 9 ] && [ $stop_stage -ge 9 ]; then
   lang_dir=data/lang_bpe_${vocab_size}

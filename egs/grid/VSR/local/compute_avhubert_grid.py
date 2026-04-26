@@ -13,8 +13,7 @@ from __future__ import annotations
 import dlib
 import torch.nn.functional as F
 import cv2
-from fairseq import checkpoint_utils, options, tasks, utils
-import fairseq
+from fairseq import checkpoint_utils
 
 import logging
 import os
@@ -26,17 +25,13 @@ from lhotse.recipes.utils import read_manifests_if_cached
 import numpy as np
 from concurrent.futures import ProcessPoolExecutor
 import logging
-from tqdm.auto import tqdm
 import torch.multiprocessing as mp
-import copy
 import itertools
 import contextlib
 import argparse
 
 
-# ------------------------------------------------------------------ #
-# CLI arguments                                                       #
-# ------------------------------------------------------------------ #
+# CLI arguments
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Extract AV-HuBERT visual features from video recordings."
@@ -101,9 +96,7 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-# ------------------------------------------------------------------ #
-# AV-HuBERT imports (scoped to avoid polluting the global namespace)  #
-# ------------------------------------------------------------------ #
+# AV-HuBERT imports (scoped to avoid polluting the global namespace)
 @contextlib.contextmanager
 def _avhubert_on_path(path: Path):
     """Temporarily add AV-HuBERT source directory to sys.path."""
@@ -123,18 +116,14 @@ def load_globals(args: argparse.Namespace):
     -------
     dict with keys: avhubert_utils, detector, predictor, device, model, transform
     """
-    # -- AV-HuBERT imports ----------------------------------------- #
+    # AV-HuBERT imports 
     if not args.avhubert_code_dir.exists():
         raise FileNotFoundError(f"AV-HuBERT code directory not found: {args.avhubert_code_dir}")
 
     with _avhubert_on_path(args.avhubert_code_dir):
-        from avhubert.utils import Compose, Normalize  # now a proper package import
-        # from avhubert import hubert_asr
-        # from avhubert import hubert_pretraining
-        # from avhubert import hubert
+        from avhubert.utils import Compose, Normalize
 
-
-    # -- Dlib ------------------------------------------------------ #
+    # Dlib 
     if not args.dlib_predictor.exists():
         raise FileNotFoundError(
             f"dlib landmark model not found: {args.dlib_predictor}\n"
@@ -144,11 +133,9 @@ def load_globals(args: argparse.Namespace):
     detector  = dlib.get_frontal_face_detector()
     predictor = dlib.shape_predictor(str(args.dlib_predictor))
 
-    # -- Device ---------------------------------------------------- #
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     logging.info(f"Using device: {device}")
 
-    # -- AV-HuBERT model ------------------------------------------- #
     if not args.avhubert_ckpt.exists():
         raise FileNotFoundError(f"AV-HuBERT checkpoint not found: {args.avhubert_ckpt}")
 
@@ -161,7 +148,7 @@ def load_globals(args: argparse.Namespace):
         f"(layers 0–{args.layer - 1}, device: {device})"
     )
 
-    # -- Transform ------------------------------------------------- #
+    # Image transform 
     transform = Compose([
         Normalize(0.0, 255.0),
         Normalize(task.cfg.image_mean, task.cfg.image_std),
@@ -174,7 +161,6 @@ def load_globals(args: argparse.Namespace):
         model=model,
         transform=transform,
     )
-
 
 
 def extract_features_from_visual(
@@ -220,14 +206,12 @@ def extract_features_from_visual(
     landmarks_file = video_path.with_suffix(".landmarks.npz")
     mouth_frames_file = video_path.with_suffix(".mouth_frames.npz")
 
-    # ------------------------------------------------------------------ #
-    # 1. Mouth frames (or cache load)                                     #
-    # ------------------------------------------------------------------ #
+    # Mouth frames (or cache load)
     if mouth_frames_file.exists():
         frames = list(np.load(mouth_frames_file)["frames"])
         logging.info(f"Loaded cached mouth frames from {mouth_frames_file}.")
     else:
-        # -- Landmarks (or cache load) ---------------------------------- #
+        # Landmarks (or cache load) 
         if landmarks_file.exists():
             landmarks = np.load(landmarks_file)["landmarks"]
             logging.info(f"Loaded cached landmarks from {landmarks_file}.")
@@ -238,7 +222,7 @@ def extract_features_from_visual(
             np.savez_compressed(landmarks_file, landmarks=landmarks.astype(np.int16))
             logging.info(f"Saved landmarks to {landmarks_file}.")
 
-        # -- ROI extraction -------------------------------------------- #
+        # ROI extraction
         frames = _extract_mouth_frames(
             video_path, landmarks, mouth_w, mouth_h, ROI_SIZE, MOUTH_LEFT, MOUTH_RIGHT
         )
@@ -252,13 +236,10 @@ def extract_features_from_visual(
     if len(frames) < MIN_FRAMES:
         logging.warning(f"Skipping {video}: only {len(frames)} frames (min {MIN_FRAMES}).")
         return None
-
-    # ------------------------------------------------------------------ #
-    # 2. AV-HuBERT feature extraction                                    #
-    # ------------------------------------------------------------------ #
+   
     frames_np = transform(np.float32(np.stack(frames)))
     tensor = torch.from_numpy(frames_np).unsqueeze(0).unsqueeze(0).to(device)
-
+     # AV-HuBERT feature extraction
     with torch.no_grad():
         features, _ = model.extract_finetune(
             source={"video": tensor, "audio": None},
@@ -394,7 +375,6 @@ def process_worker(args: tuple) -> list:
     predictor = _worker_globals["predictor"]
     device    = _worker_globals["device"]
     
-    
     FIXED_DURATION: float = 3.0
     FRAME_SHIFT: float = 0.04
     EXPECTED_FRAMES: int = 75
@@ -518,6 +498,7 @@ def compute_avhubert_grid():
         cut_set.to_file(feats_dir / f"grid_cuts_{partition}.jsonl.gz")
 
         print(f"Done {partition} → {len(all_cuts)} cuts, stored in {args.n_workers} .h5 files")
+        
 
 if __name__ == "__main__":
     formatter = "%(asctime)s %(levelname)s [%(filename)s:%(lineno)d] %(message)s"

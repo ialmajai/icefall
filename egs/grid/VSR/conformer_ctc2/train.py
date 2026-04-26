@@ -21,26 +21,24 @@
 """
 Usage:
 
-export CUDA_VISIBLE_DEVICES="0,1,2,3"
+export CUDA_VISIBLE_DEVICES="0"
 
 ./conformer_ctc2/train.py \
-  --world-size 4 \
+  --world-size 1 \
   --num-epochs 30 \
   --start-epoch 1 \
   --exp-dir conformer_ctc2/exp \
-  --full-Grid 1 \
-  --max-duration 300
+  --max-duration 1200
 
 # For mix precision training:
 
 ./conformer_ctc2/train.py \
-  --world-size 4 \
+  --world-size 1 \
   --num-epochs 30 \
   --start-epoch 1 \
   --use-fp16 1 \
   --exp-dir conformer_ctc2/exp \
-  --full-Grid 1 \
-  --max-duration 550
+  --max-duration 1200
 
 """
 
@@ -58,13 +56,10 @@ import optim
 import os
 os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
 import torch
-# 2. Set deterministic flags
+# Optional: set deterministic flags
 torch.backends.cudnn.deterministic = True
 torch.backends.cudnn.benchmark = False
 
-
-
-# import torch
 import torch.multiprocessing as mp
 import torch.nn as nn
 from asr_datamodule import GridAsrDataModule
@@ -471,7 +466,7 @@ def save_checkpoint(
     if params.best_valid_epoch == params.cur_epoch:
         best_valid_filename = params.exp_dir / "best-valid-loss.pt"
         copyfile(src=filename, dst=best_valid_filename)
-
+        
 
 def compute_loss(
     params: AttributeDict,
@@ -633,6 +628,7 @@ def compute_validation_loss(
 
     return tot_loss
 
+
 def train_one_epoch(
     params: AttributeDict,
     model: Union[nn.Module, DDP],
@@ -718,7 +714,6 @@ def train_one_epoch(
             model.parameters(), 
             max_norm=1.0  # Common value for Conformers
         )
-
 
         scheduler.step_batch(params.batch_idx_train)
         scaler.step(optimizer)

@@ -15,6 +15,7 @@
 The training command using 1 NVIDIA GeForce RTX 3080 GPU is:
 ```bash
 ./conformer_ctc2/train.py \
+  --exp-dir conformer_ctc2/exp \
   --max-duration 1400
 ```
 
@@ -22,10 +23,11 @@ The decoding command is:
 ```bash
 for m in ctc-greedy-search ctc-decoding 1best ; do
   ./conformer_ctc2/decode.py \
+    --exp-dir conformer_ctc2/exp \
     --epoch 28 \
     --avg 20 \
     --max-duration 1400 \
-    --decoding-method $m \
+    --method $m \
     --use-averaged-model False
 done
 ```

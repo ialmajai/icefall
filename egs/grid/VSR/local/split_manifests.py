@@ -17,7 +17,7 @@ recordings = recordings.filter(video_exists)
 
 supervisions = load_manifest(supervisions_path)
 
-# --- Split based on speaker ID extracted from recording ID ---
+# Split based on speaker ID extracted from recording ID
 def get_speaker_id(rec_id):
     return rec_id.split("_")[0]
 
@@ -31,7 +31,7 @@ test_recordings = recordings.filter(
 train_recordings.to_file(output_dir / "grid_recordings_train.jsonl.gz")
 test_recordings.to_file(output_dir / "grid_recordings_test.jsonl.gz")
 
-# --- Split supervisions based on matching recording IDs ---
+# Split supervisions based on matching recording IDs
 train_rec_ids = set(r.id for r in train_recordings)
 test_rec_ids = set(r.id for r in test_recordings)
 

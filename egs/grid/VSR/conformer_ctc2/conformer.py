@@ -33,7 +33,7 @@ from scaling import (
 from torch import Tensor, nn
 from transformer import Supervisions, Transformer, encoder_padding_mask
 
-#Project 
+# SSL Feature Projection
 class SSLFeatureProjection(nn.Module):
     def __init__(self, num_features=768, d_model=256):
         super().__init__()
@@ -156,8 +156,6 @@ class Conformer(Transformer):
         mask = encoder_padding_mask(x.size(0), supervisions)
         if mask is not None:
             mask = mask.to(x.device)
-
-        # Caution: We assume the subsampling factor is 4!
 
         x = self.encoder(
             x, pos_emb, src_key_padding_mask=mask, warmup=warmup
