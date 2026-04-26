@@ -2,7 +2,7 @@
 set -euo pipefail
 
 stage=1
-ROOT_DIR=/data
+ROOT_DIR=$(pwd)
 ICEFALL_DIR="$ROOT_DIR/icefall"
 AVHUBERT_DIR="$ROOT_DIR/av_hubert"
 
