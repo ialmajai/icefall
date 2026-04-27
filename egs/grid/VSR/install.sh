@@ -3,10 +3,11 @@ set -euo pipefail
 
 stage=1
 
-ICEFALL_DIR="$PWD/../../../"
-AVHUBERT_DIR="$PWD/av_hubert"
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+ICEFALL_DIR="$(cd -- "$SCRIPT_DIR/../../.." && pwd)"
+AVHUBERT_DIR="$SCRIPT_DIR/av_hubert"
 
-. shared/parse_options.sh || exit 1
+. "$ICEFALL_DIR/shared/parse_options.sh" || exit 1
 
 k2_wheel="k2-1.24.4.dev20241030+cuda12.1.torch2.4.1-cp38-cp38-manylinux_2_17_x86_64.manylinux2014_x86_64.whl"
 
