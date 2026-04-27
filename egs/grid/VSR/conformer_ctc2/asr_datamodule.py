@@ -369,19 +369,17 @@ class VisualFeatureInputStrategy(BatchIO):
             def __init__(self, frame_shift):
                 self.frame_shift = frame_shift
         return DummyExtractor(0.04)
-    
+
     def supervision_intervals(self, cuts: CutSet) -> Dict[str, torch.Tensor]:
-        
-        start_frames, nums_frames = zip(
-            *(
-                supervision_to_frames(
+        start_frames, nums_frames, sequence_idx = [], [], []
+        for i, cut in enumerate(cuts):
+            for sup in cut.supervisions:
+                start, num = supervision_to_frames(
                     sup, 0.04, cut.sampling_rate, max_frames=None
                 )
-                for cut in cuts
-                for sup in cut.supervisions
-            )
-        )
-        sequence_idx = [i for i, c in enumerate(cuts) for s in c.supervisions]
+                start_frames.append(start)
+                nums_frames.append(num)
+                sequence_idx.append(i)                
         return {
             "sequence_idx": torch.tensor(sequence_idx, dtype=torch.int32),
             "start_frame": torch.tensor(start_frames, dtype=torch.int32),
