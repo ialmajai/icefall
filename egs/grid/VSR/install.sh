@@ -44,6 +44,6 @@ if [ $stage -le 3 ] ; then
   conda install -y -c conda-forge dlib==19.18.0 
   pip install  --force-reinstall --no-deps numpy==1.23.5
 
-  echo 'export PYTHONPATH=/data/git/icefall:$PYTHONPATH'
+  echo 'export PYTHONPATH=$ICEFALL_DIR:$PYTHONPATH'
   echo 'Add the line above to your ~/.bashrc or conda activate hook'
 fi
