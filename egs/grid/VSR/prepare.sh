@@ -47,7 +47,6 @@ if [ $stage -le 0 ] && [ $stop_stage -ge 0 ]; then
     bzip2 -d shape_predictor_68_face_landmarks.dat.bz2
     mv shape_predictor_68_face_landmarks.dat $dlib_dir    
   fi
-
 fi
 
 if [ $stage -le 1 ] && [ $stop_stage -ge 1 ]; then
@@ -77,7 +76,6 @@ if [ $stage -le 4 ] && [ $stop_stage -ge 4 ]; then
   zcat data/manifests/grid_supervisions_train.jsonl.gz | jq -r .text \
 	 | sed 's: sp : :g'  > data/lm/train_sentences.txt
 fi
-
 
 if [ $stage -le 5 ] && [ $stop_stage -ge 5 ]; then
   log "Stage 6: Prepare phone based lang"
@@ -186,6 +184,5 @@ if [ $stage -le 9 ] && [ $stop_stage -ge 9 ]; then
         --lang-dir $lang_dir \
         --ngram-G ${lm_dir}/G.fst.txt
   
-  ./local/compile_hlg.py --lang-dir $lang_dir
-  
+  ./local/compile_hlg.py --lang-dir $lang_dir  
 fi
