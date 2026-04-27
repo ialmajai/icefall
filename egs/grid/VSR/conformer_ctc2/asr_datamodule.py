@@ -54,7 +54,9 @@ class _SeedWorkers:
 
 class GridAsrDataModule:
     """
-    DataModule for k2 ASR experiments.
+    DataModule for k2 VSR experiments on the GRID corpus.
+    It assumes there is always one train and valid dataloader,
+    and a single test dataloader for the held-out unseen speakers.
 
     It contains all the common data pipeline modules used in ASR
     experiments, e.g.:
