@@ -405,8 +405,8 @@ class GridAsrDataModule:
 class VisualFeatureInputStrategy(BatchIO):
     def __call__(self, cuts):
         feats = [torch.from_numpy(cut.load_custom("video_features")).float() for cut in cuts]
-        feats = torch.stack(feats, dim=0)
-        lengths = feats[0].shape[0] * torch.ones(len(feats), dtype=torch.int32)
+        lengths = torch.tensor([f.shape[0] for f in feats], dtype=torch.int32)
+        feats = torch.nn.utils.rnn.pad_sequence(feats, batch_first=True)
         return feats, lengths
       
     @property
