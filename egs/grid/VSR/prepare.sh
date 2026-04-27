@@ -64,7 +64,9 @@ if [ $stage -le 3 ] && [ $stop_stage -ge 3 ]; then
   log "Stage 2: Compute avhubert for grid"
   if [ ! -f "$avhubert_ckpt" ]; then
     log "Downloading AvHubert checkpoint"
-    wget https://dl.fbaipublicfiles.com/avhubert/model/lrs3/clean-pretrain/base_lrs3_iter5.pt -O $avhubert_ckpt
+	# https://facebookresearch.github.io/av_hubert: AV-HuBERT Base | LRS3 + VoxCeleb2 (En) | No finetuning
+	model=https://dl.fbaipublicfiles.com/avhubert/model/lrs3_vox/clean-pretrain/base_vox_iter5.pt
+    wget $model -O $avhubert_ckpt
   fi
   mkdir -p data/avhubert
 
