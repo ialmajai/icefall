@@ -1,7 +1,5 @@
 torch>=2.4.0
 torchaudio
-./k2-1.24.4.dev20241030+cuda12.1.torch2.4.1-cp38-cp38-manylinux_2_17_x86_64.manylinux2014_x86_64.whl
-git+https://github.com/lhotse-speech/lhotse
 numpy==1.23.5
 hydra-core==1.0.7
 omegaconf==2.0.6
