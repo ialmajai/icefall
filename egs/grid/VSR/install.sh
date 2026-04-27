@@ -36,13 +36,12 @@ if [ $stage -le 2 ] ; then
   pip install --editable ./
 fi
 
-cd $ICEFALL_DIR/egs/grid/VSR
-
 if [ $stage -le 3 ] ; then
+  cd $ICEFALL_DIR/egs/grid/VSR
+  
   pip install "pip<24.1"
   pip install -r grid-requirements.txt
-  conda install -y -c conda-forge dlib==19.18.0
- 
+  conda install -y -c conda-forge dlib==19.18.0 
   pip install  --force-reinstall --no-deps numpy==1.23.5
 
   echo 'export PYTHONPATH=/data/git/icefall:$PYTHONPATH'
