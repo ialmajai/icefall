@@ -562,9 +562,7 @@ def compute_loss(
                 sos_id=graph_compiler.sos_id,
                 eos_id=graph_compiler.eos_id,
             )
-            if att_loss > 0.4 and att_loss < 0.8:
-                print("Warning: Your attention loss is quite high, it may be due to "
-                      "a bug in your code. Please double check it.")
+      
         loss = (1.0 - params.att_rate) * ctc_loss + params.att_rate * att_loss
     else:
         loss = ctc_loss
