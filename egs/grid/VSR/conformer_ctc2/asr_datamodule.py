@@ -157,7 +157,6 @@ class GridAsrDataModule:
             "field: batch['supervisions']['cut'] with the cuts that "
             "were used to construct it.",
         )
-
         group.add_argument(
             "--num-workers",
             type=int,
@@ -165,14 +164,12 @@ class GridAsrDataModule:
             help="The number of training dataloader workers that "
             "collect the batches.",
         )
-
         group.add_argument(
             "--enable-spec-aug",
             type=str2bool,
             default=True,
             help="When enabled, use SpecAugment for training dataset.",
         )
-
         group.add_argument(
             "--spec-aug-time-warp-factor",
             type=int,
@@ -182,7 +179,6 @@ class GridAsrDataModule:
             "Larger values mean more warping. "
             "A value less than 1 means to disable time warp.",
         )
-
         group.add_argument(
             "--input-strategy",
             type=str,
@@ -246,51 +242,19 @@ class GridAsrDataModule:
             return_cuts=self.args.return_cuts,
         )
 
-        if self.args.on_the_fly_feats:
-            # NOTE: the PerturbSpeed transform should be added only if we
-            # remove it from data prep stage.
-            # Add on-the-fly speed perturbation; since originally it would
-            # have increased epoch size by 3, we will apply prob 2/3 and use
-            # 3x more epochs.
-            # Speed perturbation probably should come first before
-            # concatenation, but in principle the transforms order doesn't have
-            # to be strict (e.g. could be randomized)
-            # transforms = [PerturbSpeed(factors=[0.9, 1.1], p=2/3)] + transforms   # noqa
-            # Drop feats to be on the safe side.
-            train = K2SpeechRecognitionDataset(
-                cut_transforms=transforms,
-                input_strategy=OnTheFlyFeatures(VisualFeatureInputStrategy()),
-                input_transforms=input_transforms,
-                return_cuts=self.args.return_cuts,
-            )
-
-        if self.args.bucketing_sampler:
-            logging.info("Using DynamicBucketingSampler.")
-            train_sampler = DynamicBucketingSampler(
-                cuts_train,
-                max_duration=self.args.max_duration,
-                shuffle=self.args.shuffle,
-                num_buckets=self.args.num_buckets,
-                buffer_size=self.args.num_buckets * 5000,
-                drop_last=self.args.drop_last,
-            )
-        else:
-            logging.info("Using SimpleCutSampler.")
-            train_sampler = SimpleCutSampler(
-                cuts_train,
-                max_duration=self.args.max_duration,
-                shuffle=self.args.shuffle,
-                drop_last=self.args.drop_last,
-            )
+        logging.info("Using SimpleCutSampler.")
+        train_sampler = SimpleCutSampler(
+            cuts_train,
+            max_duration=self.args.max_duration,
+            shuffle=self.args.shuffle,
+            drop_last=self.args.drop_last,
+        )
+        
         logging.info("About to create train dataloader")
-
         if sampler_state_dict is not None:
             logging.info("Loading sampler state dict")
             train_sampler.load_state_dict(sampler_state_dict)
 
-        # 'seed' is derived from the current random state, which will have
-        # previously been set in the main process.
-        # seed = torch.randint(0, 100000, ()).item()
         worker_init_fn = _SeedWorkers(self.args.seed)
 
         train_dl = DataLoader(
@@ -314,23 +278,17 @@ class GridAsrDataModule:
             ] + transforms
 
         logging.info("About to create dev dataset")
-        if self.args.on_the_fly_feats:
-            validate = K2SpeechRecognitionDataset(
-                cut_transforms=transforms,
-                input_strategy=VisualFeatureInputStrategy(),
-                return_cuts=self.args.return_cuts,
-            )
-        else:
-            validate = K2SpeechRecognitionDataset(
-                input_strategy=VisualFeatureInputStrategy(),
-                cut_transforms=transforms,
-                return_cuts=self.args.return_cuts,
-            )
+        validate = K2SpeechRecognitionDataset(
+            input_strategy=VisualFeatureInputStrategy(),
+            cut_transforms=transforms,
+            return_cuts=self.args.return_cuts,
+        )
+        
         valid_sampler = SimpleCutSampler(
                 cuts_valid,
                 max_duration=self.args.max_duration,
                 shuffle=False,
-            )
+        )
 
         logging.info("About to create dev dataloader")
         valid_dl = DataLoader(
