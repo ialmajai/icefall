@@ -699,18 +699,17 @@ def train_one_epoch(
         # scaler.scale(loss).backward()
 
         try:
-            # loss.backward()
             scaler.scale(loss).backward()
         except RuntimeError as e:
             if "CUDA out of memory" in str(e):
                 logging.error(f"failing batch size:{batch_size} ")
             raise
         
-        # scaler.unscale_(optimizer)
+        scaler.unscale_(optimizer)
 
         grad_norm = torch.nn.utils.clip_grad_norm_(
             model.parameters(), 
-            max_norm=1.0  # Common value for Conformers
+            max_norm=1.0
         )
 
         scheduler.step_batch(params.batch_idx_train)
