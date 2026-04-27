@@ -13,7 +13,7 @@ dl_dir=$PWD/download/grid-corpus
 lang_dir=data/lang_phone
 lm_dir=data/lm
 
-avhubert_code_dir="/data/av_hubert"
+avhubert_code_dir="$PWD/av_hubert"
 # Pre-trained base AvHubert checkpoint (no fine-tuning)
 avhubert_ckpt=avhubert-ckpts/base_vox_iter5.pt
 feats_dir=data/avhubert
