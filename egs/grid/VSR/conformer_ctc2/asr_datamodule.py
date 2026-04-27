@@ -357,6 +357,10 @@ class GridAsrDataModule:
         return cuts
 
 class VisualFeatureInputStrategy(BatchIO):
+    def __init__(self, frame_shift: float = 0.04):
+        super().__init__()
+        self.frame_shift = frame_shift
+        
     def __call__(self, cuts):
         feats = [torch.from_numpy(cut.load_custom("video_features")).float() for cut in cuts]
         lengths = torch.tensor([f.shape[0] for f in feats], dtype=torch.int32)
@@ -368,14 +372,14 @@ class VisualFeatureInputStrategy(BatchIO):
         class DummyExtractor:
             def __init__(self, frame_shift):
                 self.frame_shift = frame_shift
-        return DummyExtractor(0.04)
+        return DummyExtractor(self.frame_shift)
 
     def supervision_intervals(self, cuts: CutSet) -> Dict[str, torch.Tensor]:
         start_frames, nums_frames, sequence_idx = [], [], []
         for i, cut in enumerate(cuts):
             for sup in cut.supervisions:
                 start, num = supervision_to_frames(
-                    sup, 0.04, cut.sampling_rate, max_frames=None
+                    sup, self.frame_shift, cut.sampling_rate, max_frames=None
                 )
                 start_frames.append(start)
                 nums_frames.append(num)
