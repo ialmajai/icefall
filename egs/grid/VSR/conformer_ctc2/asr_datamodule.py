@@ -55,9 +55,6 @@ class _SeedWorkers:
 class GridAsrDataModule:
     """
     DataModule for k2 ASR experiments.
-    It assumes there is always one train and valid dataloader,
-    but there can be multiple test dataloaders (e.g. GridSpeech test-clean
-    and test-other).
 
     It contains all the common data pipeline modules used in ASR
     experiments, e.g.:
@@ -65,7 +62,6 @@ class GridAsrDataModule:
     - bucketing samplers,
     - cut concatenation,
     - augmentation,
-    - on-the-fly feature extraction
 
     This class should be derived for specific corpora used in ASR tasks.
     """
