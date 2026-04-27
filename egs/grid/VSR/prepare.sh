@@ -15,13 +15,14 @@ lm_dir=data/lm
 
 avhubert_code_dir="$PWD/av_hubert"
 # Pre-trained base AvHubert checkpoint (no fine-tuning)
-avhubert_ckpt=avhubert-ckpts/base_vox_iter5.pt
+avhubert_ckpts=download/avhubert-ckpts
 feats_dir=data/avhubert
 
 . shared/parse_options.sh || exit 1
 
 mkdir -p $lang_dir
 mkdir -p $lm_dir
+mkdir -p $avhubert_ckpts
 
 log() {
   # This function is from espnet
@@ -66,10 +67,10 @@ if [ $stage -le 3 ] && [ $stop_stage -ge 3 ]; then
     log "Downloading AvHubert checkpoint"
 	# https://facebookresearch.github.io/av_hubert: AV-HuBERT Base | LRS3 + VoxCeleb2 (En) | No finetuning
 	model=https://dl.fbaipublicfiles.com/avhubert/model/lrs3_vox/clean-pretrain/base_vox_iter5.pt
-    wget $model -O $avhubert_ckpt
+    wget $model -O $avhubert_ckpts/base_vox_iter5.pt
   fi
+  
   mkdir -p data/avhubert
-
   ./local/compute_avhubert_grid.py --avhubert-code-dir ${avhubert_code_dir} \
 	  --avhubert-ckpt ${avhubert_ckpt} --feats-dir ${feats_dir} 
 fi
