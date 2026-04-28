@@ -382,9 +382,13 @@ def process_worker(args: tuple) -> list:
 
     h5_path = feats_dir / f"{partition}_avhubert_{worker_id:02d}.h5"
     video_cuts = []
-
+    sup_by_rec = {s.recording_id: s for s in supervisions_subset}
     with NumpyHdf5Writer(h5_path) as writer:
-        for recording, supervision in zip(recordings_subset, supervisions_subset):
+        for recording in recordings_subset:
+            supervision = sup_by_rec.get(recording.id)
+            if supervision is None:
+                logging.warning(f"Worker {worker_id} - no supervision for {recording.id}, skipping.")
+                continue
             try:
                 feats = extract_features_from_visual(recording.sources[0].source, detector, \
                     predictor, device, model, transform, layer)
