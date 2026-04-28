@@ -72,7 +72,7 @@ if [ $stage -le 3 ] && [ $stop_stage -ge 3 ]; then
   
   mkdir -p data/avhubert
   ./local/compute_avhubert_grid.py --avhubert-code-dir ${avhubert_code_dir} \
-	  --avhubert-ckpt ${avhubert_ckpt} --feats-dir ${feats_dir} 
+	  --avhubert-ckpt ${avhubert_ckpts}/base_vox_iter5.pt --feats-dir ${feats_dir} 
 fi
 
 if [ $stage -le 4 ] && [ $stop_stage -ge 4 ]; then
