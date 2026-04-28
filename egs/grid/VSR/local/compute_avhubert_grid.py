@@ -443,7 +443,7 @@ def compute_avhubert_grid():
     try:
         feats_dir.mkdir(parents=True)
     except FileExistsError:
-        print(f"Error: '{feats_dir}' is an existing path.")
+        logging.info(f"Warning: '{feats_dir}' is an existing path.")
 
     dataset_parts = (
         "test",
@@ -467,7 +467,7 @@ def compute_avhubert_grid():
     )
    
     for partition, m in manifests.items():
-        print(f"\nProcessing {partition} with {args.n_workers} workers")
+        logging.info(f"\nProcessing {partition} with {args.n_workers} workers")
 
         recordings = list(m["recordings"])
         supervisions = list(m["supervisions"])
@@ -501,7 +501,7 @@ def compute_avhubert_grid():
         cut_set = CutSet.from_cuts(all_cuts)
         cut_set.to_file(feats_dir / f"grid_cuts_{partition}.jsonl.gz")
 
-        print(f"Done {partition} → {len(all_cuts)} cuts, stored in {args.n_workers} .h5 files")
+        logging.info(f"Done {partition} → {len(all_cuts)} cuts, stored in {args.n_workers} .h5 files")
         
 
 if __name__ == "__main__":
