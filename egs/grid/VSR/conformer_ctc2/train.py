@@ -704,8 +704,6 @@ def train_one_epoch(
             if "CUDA out of memory" in str(e):
                 logging.error(f"failing batch size:{batch_size} ")
             raise
-        
-        scaler.unscale_(optimizer)
 
         grad_norm = torch.nn.utils.clip_grad_norm_(
             model.parameters(), 
