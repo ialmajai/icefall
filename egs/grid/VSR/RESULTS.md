@@ -16,7 +16,8 @@ The training command using a single NVIDIA GeForce RTX 3080 GPU is:
 ```bash
 ./conformer_ctc2/train.py \
   --exp-dir conformer_ctc2/exp \
-  --max-duration 1400
+  --max-duration 1400 \
+  --use-fp16 1
 ```
 
 The decoding command is:
