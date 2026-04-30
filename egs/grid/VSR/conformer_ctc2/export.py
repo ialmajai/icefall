@@ -171,6 +171,7 @@ def main():
         subsampling_factor=params.subsampling_factor,
         num_encoder_layers=params.num_encoder_layers,
         num_decoder_layers=params.num_decoder_layers,
+        dim_feedforward=1024,
     )
 
     model.to(device)

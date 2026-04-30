@@ -2,17 +2,17 @@
 
 ### [conformer_ctc2](./conformer_ctc2)
 
-### 2026-04-18
+### 2026-04-30
 
 
 | WER | |
 |------------------------|-----|
-| ctc-greedy-search      | 7.79% |
-| ctc-decoding           | 7.79% |
-| 1best                  | 6.94% |
+| ctc-greedy-search      | 7.35% |
+| ctc-decoding           | 7.35% |
+| 1best                  | 6.72% |
 
 
-The training command using 1 NVIDIA GeForce RTX 3080 GPU is:
+The training command using a single NVIDIA GeForce RTX 3080 GPU is:
 ```bash
 ./conformer_ctc2/train.py \
   --exp-dir conformer_ctc2/exp \
@@ -24,9 +24,24 @@ The decoding command is:
 for m in ctc-greedy-search ctc-decoding 1best ; do
   ./conformer_ctc2/decode.py \
     --exp-dir conformer_ctc2/exp \
-    --epoch 28 \
-    --avg 20 \
-    --max-duration 1400 \
+    --epoch 30 \
+    --avg 15 \
+    --method $m \
+    --use-averaged-model False
+done
+```
+
+You can find a pretrained model by visiting
+<https://huggingface.co/ialmajai/icefall-vsr-grid-conformer-ctc2-bpe-58-2026-04-29>
+
+```bash
+# copy to pretrained.pt to $PWD/epoch-999.pt 
+
+for m in ctc-greedy-search ctc-decoding 1best ; do
+  ./conformer_ctc2/decode.py \
+    --exp-dir $PWD \
+    --epoch 999 \
+    --avg 1 \
     --method $m \
     --use-averaged-model False
 done

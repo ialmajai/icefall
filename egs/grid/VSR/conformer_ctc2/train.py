@@ -180,7 +180,7 @@ def get_parser():
     parser.add_argument(
         "--lr-batches",
         type=float,
-        default=1000,
+        default=1500,
         help="""Number of steps that affects how rapidly the learning rate decreases.
         We suggest not to change this.""",
     )
@@ -188,7 +188,7 @@ def get_parser():
     parser.add_argument(
         "--lr-epochs",
         type=float,
-        default=5,
+        default=6,
         help="""Number of epochs that affects how rapidly the learning rate decreases.
         """,
     )
@@ -336,7 +336,7 @@ def get_params() -> AttributeDict:
             "feature_dim": 768,
             "subsampling_factor": 1,
             "encoder_dim": 256,
-            "nhead": 4,
+            "nhead": 8,
             "dim_feedforward": 1024,
             "num_encoder_layers": 4,
             # parameters for ctc loss
@@ -344,7 +344,7 @@ def get_params() -> AttributeDict:
             "reduction": "sum",
             "use_double_scores": True,
             # parameters for Noam
-            "model_warm_step": 200,  # arg given to model, not for lrate
+            "model_warm_step": 200,
             "env_info": get_env_info(),
         }
     )
@@ -704,6 +704,8 @@ def train_one_epoch(
             if "CUDA out of memory" in str(e):
                 logging.error(f"failing batch size:{batch_size} ")
             raise
+        
+        scaler.unscale_(optimizer)
 
         grad_norm = torch.nn.utils.clip_grad_norm_(
             model.parameters(), 
