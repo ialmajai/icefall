@@ -62,7 +62,7 @@ if [ $stage -le 2 ] && [ $stop_stage -ge 2 ]; then
 fi
 
 if [ $stage -le 3 ] && [ $stop_stage -ge 3 ]; then
-  log "Stage 2: Compute avhubert for grid"
+  log "Stage 3: Compute avhubert for grid"
   if [ ! -f "$avhubert_ckpts"/base_vox_iter5.pt ]; then
     log "Downloading AvHubert checkpoint"
 	# https://facebookresearch.github.io/av_hubert: AV-HuBERT Base | LRS3 + VoxCeleb2 (En) | No finetuning
@@ -76,12 +76,13 @@ if [ $stage -le 3 ] && [ $stop_stage -ge 3 ]; then
 fi
 
 if [ $stage -le 4 ] && [ $stop_stage -ge 4 ]; then
+  log "Stage 4: Prepare train text for grid"
   zcat data/manifests/grid_supervisions_train.jsonl.gz | jq -r .text \
 	 | sed 's: sp : :g'  > data/lm/train_sentences.txt
 fi
 
 if [ $stage -le 5 ] && [ $stop_stage -ge 5 ]; then
-  log "Stage 6: Prepare phone based lang"
+  log "Stage 5: Prepare phone based lang"
   lang_dir=data/lang_phone
   mkdir -p $lang_dir
   
@@ -119,7 +120,7 @@ if [ $stage -le 5 ] && [ $stop_stage -ge 5 ]; then
 fi
 
 if [ $stage -le 6 ] && [ $stop_stage -ge 6 ]; then
-  log "Stage 4: Prepare G"
+  log "Stage 6: Prepare G"
   # Create FST grammar for the GRID
   grammar_cmd="local/create_chime1_grammar.pl"
   lang_dir=data/lang_phone
@@ -137,7 +138,7 @@ fi
 vocab_size=58
 
 if [ $stage -le 7 ] && [ $stop_stage -ge 7 ]; then
-  log "Stage 6: Prepare BPE based lang"
+  log "Stage 7: Prepare BPE based lang"
   lang_dir=data/lang_bpe_${vocab_size}
   mkdir -p $lang_dir
   ./local/train_bpe_model.py \
@@ -147,7 +148,7 @@ if [ $stage -le 7 ] && [ $stop_stage -ge 7 ]; then
 fi
 
 if [ $stage -le 8 ] && [ $stop_stage -ge 8 ]; then
-    log "Stage 0: Prepare BPE based lexicon."
+    log "Stage 8: Prepare BPE based lexicon"
 
     lang_dir=data/lang_bpe_${vocab_size}
     # We reuse words.txt from phone based lexicon
@@ -181,6 +182,7 @@ if [ $stage -le 8 ] && [ $stop_stage -ge 8 ]; then
 fi
 
 if [ $stage -le 9 ] && [ $stop_stage -ge 9 ]; then
+  log "Stage 9: Generate and Compile LG & HLG"
   lang_dir=data/lang_bpe_${vocab_size}
   
   ./local/prepare_lang_fst.py  \
