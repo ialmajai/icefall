@@ -5,7 +5,7 @@
 ### 2026-04-30
 
 
-|  | WER |
+|  | WER (unseen speaker) |
 |------------------------|-----|
 | ctc-greedy-search      | 7.35% |
 | ctc-decoding           | 7.35% |
