@@ -5,7 +5,7 @@
 ### 2026-04-30
 
 
-| WER | |
+|  | WER |
 |------------------------|-----|
 | ctc-greedy-search      | 7.35% |
 | ctc-decoding           | 7.35% |
@@ -36,7 +36,7 @@ You can find a pretrained model by visiting
 <https://huggingface.co/ialmajai/icefall-vsr-grid-conformer-ctc2-bpe-58-2026-04-29>
 
 ```bash
-# copy to pretrained.pt to $PWD/epoch-999.pt 
+# copy pretrained.pt to $PWD/epoch-999.pt 
 
 for m in ctc-greedy-search ctc-decoding 1best ; do
   ./conformer_ctc2/decode.py \
