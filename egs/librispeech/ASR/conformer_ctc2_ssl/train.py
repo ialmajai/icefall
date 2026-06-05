@@ -190,7 +190,7 @@ def get_parser():
     parser.add_argument(
         "--lr-epochs",
         type=float,
-        default=5,
+        default=6,
         help="""Number of epochs that affects how rapidly the learning rate decreases.
         """,
     )
@@ -333,7 +333,7 @@ def get_params() -> AttributeDict:
             "batch_idx_train": 0,
             "log_interval": 20,
             "reset_interval": 200,
-            "valid_interval": 300,
+            "valid_interval": 3000,
             # parameters for conformer
             "feature_dim": 768,
             "feature_projection_dim": 128,
@@ -347,7 +347,7 @@ def get_params() -> AttributeDict:
             "reduction": "sum",
             "use_double_scores": True,
             # parameters for Noam
-            "model_warm_step": 2100,  # arg given to model, not for lrate
+            "model_warm_step": 3000,  # arg given to model, not for lrate
             "env_info": get_env_info(),
         }
     )

@@ -8,7 +8,7 @@ Features are saved under data/{model_tag}_{layer}.
 
 import argparse
 import logging
-logging.getLogger("httpx").setLevel(logging.WARNING)
+# logging.getLogger("httpx").setLevel(logging.WARNING)
 from dataclasses import dataclass
 from pathlib import Path
 import sentencepiece as spm
@@ -17,7 +17,7 @@ import numpy as np
 import torch
 from filter_cuts import filter_cuts
 
-from lhotse import CutSet, LilcomChunkyWriter
+from lhotse import CutSet, LilcomChunkyWriter, RecordingSet
 from lhotse.features.base import FeatureExtractor
 from lhotse.recipes.utils import read_manifests_if_cached
 from lhotse.utils import compute_num_frames
@@ -225,8 +225,31 @@ def compute_ssl_librispeech(
     )
     
     assert manifests is not None
+    
+    musan_dir = Path("data/manifests")
+    if (musan_dir / "musan_recordings_noise.jsonl.gz").is_file():
+        
+        musan_recordings = {
+            "noise":  RecordingSet.from_jsonl_lazy(
+                        musan_dir / "musan_recordings_noise.jsonl.gz"),
+            "music":  RecordingSet.from_jsonl_lazy(
+                        musan_dir / "musan_recordings_music.jsonl.gz"),
+            "speech": RecordingSet.from_jsonl_lazy(
+                        musan_dir / "musan_recordings_speech.jsonl.gz"),
+        }
+        # convert recordings to cuts so lhotse can mix them with librispeech cuts
+        musan_cuts = {
+            k: CutSet.from_manifests(recordings=v)
+            for k, v in musan_recordings.items()
+        }
+        logging.info("Loaded MUSAN recordings for audio-level augmentation")
+    else:
+        musan_cuts = None
+        logging.warning("MUSAN recordings not found -- skipping noise augmentation")
+    
+    
 
-    num_jobs = 1
+    num_jobs = 6
 
     with get_executor() as ex:  # Initialize the executor only once.
         for partition, m in manifests.items():
@@ -245,10 +268,45 @@ def compute_ssl_librispeech(
                     cut_set = filter_cuts(cut_set, sp)
                 if perturb_speed:
                     logging.info(f"Doing speed perturb")
-                    cut_set = (
+                    cut_set_sp = (
                         cut_set
                         + cut_set.perturb_speed(0.9)
                         + cut_set.perturb_speed(1.1)
+                    )
+                
+                if musan_cuts is not None:
+                    logging.info("Adding MUSAN noise augmentation at audio level")
+
+                    musan_noise_cuts  = musan_cuts["noise"]
+                    musan_music_cuts  = musan_cuts["music"]
+                    musan_speech_cuts = musan_cuts["speech"]
+                    
+                    np.random.seed(42)
+
+                    noisy_set = cut_set.mix(
+                        musan_noise_cuts,
+                        snr=[10.0, 20.0],
+                        mix_prob=1.0,
+                    )
+                    music_set = cut_set.mix(
+                        musan_music_cuts,
+                        snr=[10, 20],
+                        mix_prob=1.0,
+                    )
+                    speech_set = cut_set.mix(
+                        musan_speech_cuts,
+                        snr=[13, 20],
+                        mix_prob=1.0,
+                    )
+                    # combine clean + all augmented versions
+                    # audio mixing happens here at cut level, before any feature extraction
+                    cut_set = ( cut_set_sp 
+                               + noisy_set 
+                               + music_set 
+                               + speech_set
+                               )
+                    logging.info(
+                        f"Combined cut set size after MUSAN augmentation: {len(cut_set)}"
                     )
             cut_set = cut_set.compute_and_store_features(
                 extractor=extractor,

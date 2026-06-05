@@ -259,7 +259,7 @@ class LibriSpeechAsrDataModule:
             # Set the value of num_frame_masks according to Lhotse's version.
             # In different Lhotse's versions, the default of num_frame_masks is
             # different.
-            num_frame_masks = 10
+            num_frame_masks = 5
             num_frame_masks_parameter = inspect.signature(
                 SpecAugment.__init__
             ).parameters["num_frame_masks"]
@@ -356,7 +356,7 @@ class LibriSpeechAsrDataModule:
         if self.args.on_the_fly_feats:
             validate = K2SpeechRecognitionDataset(
                 cut_transforms=transforms,
-                input_strategy=OnTheFlyFeatures(Fbank(FbankConfig(num_mel_bins=80))),
+                input_strategy=OnTheFlyFeatures(Fbank(FbankConfig(num_mel_bins=768))),
                 return_cuts=self.args.return_cuts,
             )
         else:

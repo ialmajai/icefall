@@ -40,11 +40,13 @@ embedding_layer=9
 ssl_dir=${ssl_model}_$embedding_layer
 
 parts=(
-      test-clean
-      test-other
-      dev-clean
-      dev-other
-      train-clean-100
+    test-clean
+    test-other
+    dev-clean
+    dev-other
+    train-clean-100
+    train-clean-360
+    train-other-500
 )
 
 if [ $stage -le 0 ] && [ $stop_stage -ge 0 ]; then
@@ -53,14 +55,23 @@ if [ $stage -le 0 ] && [ $stop_stage -ge 0 ]; then
   if [ ! -e data/$ssl_dir/.librispeech.done ]; then
 	  
     ./local/compute_ssl_librispeech.py --bpe-model  data/lang_bpe_500/bpe.model \
-        --dataset "${parts[*]}" --model $ssl_model --layer $embedding_layer
+        --dataset "${parts[*]}" --model $ssl_model --layer $embedding_layer 
     
     touch data/$ssl_dir/.librispeech.done
   fi
 
-  if [ ! -L data/$ssl_dir/librispeech_cuts_train-all-shuf.jsonl.gz ]; then
-    ln -rs data/$ssl_dir/librispeech_cuts_train-clean-100.jsonl.gz \
-           data/$ssl_dir/librispeech_cuts_train-all-shuf.jsonl.gz
+  if [ ! -f data/$ssl_dir/librispeech_cuts_train-all-shuf.jsonl.gz ]; then
+    if [ -f data/$ssl_dir/librispeech_cuts_train-other-500.jsonl.gz ]; then
+    
+      cat <(gunzip -c data/$ssl_dir/librispeech_cuts_train-clean-100.jsonl.gz) \
+        <(gunzip -c data/$ssl_dir/librispeech_cuts_train-clean-360.jsonl.gz) \
+        <(gunzip -c data/$ssl_dir/librispeech_cuts_train-other-500.jsonl.gz) | \
+        shuf | gzip -c > data/$ssl_dir/librispeech_cuts_train-all-shuf.jsonl.gz
+
+    else 
+      cat <(gunzip -c data/$ssl_dir/librispeech_cuts_train-clean-100.jsonl.gz) \
+        shuf | gzip -c > data/$ssl_dir/librispeech_cuts_train-all-shuf.jsonl.gz
+    fi
   fi
 
   if [ ! -e data/$ssl_dir/.librispeech-validated.done ]; then
