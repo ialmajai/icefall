@@ -19,6 +19,7 @@
 
 import argparse
 import logging
+import sys
 from collections import defaultdict
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -59,6 +60,12 @@ from icefall.utils import (
     str2bool,
     write_error_stats,
 )
+
+# `p9_wer_hamming_dist` lives in the recipe's local/ dir (not on sys.path when
+# running conformer_ctc2/decode.py), so add it before importing.
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "local"))
+from p9_wer_hamming_dist import hamming_wer
+
 
 def get_parser():
     parser = argparse.ArgumentParser(
@@ -138,7 +145,7 @@ def get_parser():
     parser.add_argument(
         "--num-decoder-layers",
         type=int,
-        default=2,
+        default=3,
         help="""Number of decoder layer of transformer decoder.
         Setting this to 0 will not create the decoder at all (pure CTC model)
         """,
@@ -256,11 +263,11 @@ def get_params() -> AttributeDict:
             "feature_dim": 768,
             "nhead": 8,
             "dim_feedforward": 1024,
-            "encoder_dim": 256,
-            "num_encoder_layers": 4,
+            "encoder_dim": 128,
+            "num_encoder_layers": 6,
             # parameters for decoding
             "search_beam": 20,
-            "output_beam": 8,
+            "output_beam": 4,
             "min_active_states": 30,
             "max_active_states": 10000,
             "use_double_scores": True,
@@ -675,6 +682,21 @@ def decode_dataset(
     return results
 
 
+def compute_hamming_wer(
+    results: List[Tuple[str, List[str], List[str]]]
+) -> float:
+    """Corpus-level visual-Hamming WER (percentage), micro-averaged over
+    utterances. A substituted word is only forgiven when its visual Hamming
+    distance to the reference is zero (see local/p9_wer_hamming_dist.py)."""
+    tot_cost = 0.0
+    tot_ref = 0
+    for _, ref_words, hyp_words in results:
+        r = hamming_wer(ref_words, hyp_words, verbose=False)
+        tot_cost += r["hamming_sub_cost"] + r["D"] + r["I"]
+        tot_ref += r["N"]
+    return 100.0 * tot_cost / tot_ref if tot_ref > 0 else 0.0
+
+
 def save_results(
     params: AttributeDict,
     test_set_name: str,
@@ -686,6 +708,7 @@ def save_results(
     else:
         enable_log = True
     test_set_wers = dict()
+    test_set_hamming_wers = dict()
     for key, results in results_dict.items():
         recog_path = params.exp_dir / f"recogs-{test_set_name}-{key}.txt"
         results = sorted(results)
@@ -702,20 +725,28 @@ def save_results(
             )
             test_set_wers[key] = wer
 
+        test_set_hamming_wers[key] = compute_hamming_wer(results)
+
         if enable_log:
             logging.info("Wrote detailed error stats to {}".format(errs_filename))
 
     test_set_wers = sorted(test_set_wers.items(), key=lambda x: x[1])
     errs_info = params.exp_dir / f"wer-summary-{test_set_name}.txt"
     with open(errs_info, "w") as f:
-        print("settings\tWER", file=f)
+        print("settings\tWER\tHamming-WER", file=f)
         for key, val in test_set_wers:
-            print("{}\t{}".format(key, val), file=f)
+            print(
+                "{}\t{}\t{}".format(key, val, test_set_hamming_wers[key]), file=f
+            )
 
-    s = "\nFor {}, WER of different settings are:\n".format(test_set_name)
+    s = "\nFor {}, WER (and visual-Hamming WER) of different settings are:\n".format(
+        test_set_name
+    )
     note = "\tbest for {}".format(test_set_name)
     for key, val in test_set_wers:
-        s += "{}\t{}{}\n".format(key, val, note)
+        s += "{}\t{}\tHamming {}{}\n".format(
+            key, val, test_set_hamming_wers[key], note
+        )
         note = ""
     logging.info(s)
 

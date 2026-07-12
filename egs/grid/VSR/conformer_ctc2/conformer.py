@@ -32,18 +32,19 @@ from scaling import (
 )
 from torch import Tensor, nn
 from transformer import Supervisions, Transformer, encoder_padding_mask
+import logging
 
 # SSL Feature Projection
 class SSLFeatureProjection(nn.Module):
     def __init__(self, num_features=768, d_model=256):
         super().__init__()
         self.proj = nn.Linear(num_features , d_model)
-        self.dropout = nn.Dropout(p=0.1)
-        self.act = nn.GELU()
+        # To try out:   scaled linear projection
+        #self.proj = ScaledLinear(num_features , d_model, bias=True)
+        self.dropout = nn.Dropout(p=0.05)
 
     def forward(self, x, x_lens=None):
         x = self.proj(x)
-        x = self.act(x)
         x = self.dropout(x)
         if x_lens is not None:
             return x, x_lens
@@ -106,7 +107,7 @@ class Conformer(Transformer):
             d_model=d_model,
         )    
 
-        self.input_layer_norm = nn.LayerNorm(d_model)
+        self.input_layer_norm = BasicNorm(d_model)
 
         self.encoder_pos = RelPositionalEncoding(d_model, dropout)
 
@@ -146,10 +147,19 @@ class Conformer(Transformer):
             Tensor: Predictor tensor of dimension (input_length, batch_size, d_model).
             Tensor: Mask tensor of dimension (batch_size, input_length)
         """
-        x = self.encoder_embed(x)
         
-        #it doesn't seem to help
-        # x = self.input_layer_norm(x)
+        # logging.info(f"input finite: {torch.isfinite(x).all()}")
+        # logging.info(f"input max: {x.abs().max()}")
+        # logging.info(f"input min: {x.min()}")
+        # logging.info(f"input mean: {x.mean()}")
+        # logging.info(f"input std: {x.std()}")
+        x = self.encoder_embed(x)
+        x = self.input_layer_norm(x)
+        # logging.info(f"proj output finite: {torch.isfinite(x).all()}")
+        # logging.info(f"proj output max: {x.abs().max()}")
+        # logging.info(f"proj output mean: {x.mean()}")
+        # logging.info(f"proj output std: {x.std()}")
+        
         
         x, pos_emb = self.encoder_pos(x)
         x = x.permute(1, 0, 2)  # (N, T, C) -> (T, N, C)

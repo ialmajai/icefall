@@ -43,6 +43,39 @@ export CUDA_VISIBLE_DEVICES="0"
 """
 
 
+from icefall.utils import (
+    AttributeDict,
+    MetricsTracker,
+    create_grad_scaler,
+    encode_supervisions,
+    setup_logger,
+    str2bool,
+    torch_autocast,
+)
+from icefall.lexicon import Lexicon
+from icefall.graph_compiler import CtcTrainingGraphCompiler
+from icefall.env import get_env_info
+from icefall.dist import cleanup_dist, setup_dist
+from icefall.checkpoint import (
+    save_checkpoint_with_global_batch_idx,
+    update_averaged_model,
+)
+from icefall.checkpoint import save_checkpoint as save_checkpoint_impl
+from icefall.checkpoint import load_checkpoint, remove_checkpoints
+from icefall.bpe_graph_compiler import BpeCtcTrainingGraphCompiler
+from icefall import diagnostics
+from torch.utils.tensorboard import SummaryWriter
+from torch.nn.parallel import DistributedDataParallel as DDP
+from torch import Tensor
+from optim import Eden, Eve
+from lhotse.utils import fix_random_seed
+from lhotse.dataset.sampling.base import CutSampler
+from lhotse.cut import Cut
+from conformer import Conformer
+from asr_datamodule import GridAsrDataModule
+import torch.nn as nn
+import torch.multiprocessing as mp
+import torch
 import argparse
 import copy
 import logging
@@ -54,45 +87,16 @@ from typing import Any, Dict, Optional, Tuple, Union
 import k2
 import optim
 import os
+import sys
 os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
-import torch
 # Optional: set deterministic flags
 torch.backends.cudnn.deterministic = True
 torch.backends.cudnn.benchmark = False
 
-import torch.multiprocessing as mp
-import torch.nn as nn
-from asr_datamodule import GridAsrDataModule
-from conformer import Conformer
-from lhotse.cut import Cut
-from lhotse.dataset.sampling.base import CutSampler
-from lhotse.utils import fix_random_seed
-from optim import Eden, Eve
-from torch import Tensor
-from torch.nn.parallel import DistributedDataParallel as DDP
-from torch.utils.tensorboard import SummaryWriter
 
-from icefall import diagnostics
-from icefall.bpe_graph_compiler import BpeCtcTrainingGraphCompiler
-from icefall.checkpoint import load_checkpoint, remove_checkpoints
-from icefall.checkpoint import save_checkpoint as save_checkpoint_impl
-from icefall.checkpoint import (
-    save_checkpoint_with_global_batch_idx,
-    update_averaged_model,
-)
-from icefall.dist import cleanup_dist, setup_dist
-from icefall.env import get_env_info
-from icefall.graph_compiler import CtcTrainingGraphCompiler
-from icefall.lexicon import Lexicon
-from icefall.utils import (
-    AttributeDict,
-    MetricsTracker,
-    create_grad_scaler,
-    encode_supervisions,
-    setup_logger,
-    str2bool,
-    torch_autocast,
-)
+# Filter warnings originating from torch.nn.functional
+warnings.filterwarnings("ignore", module="torch.nn.functional")
+
 
 LRSchedulerType = Union[torch.optim.lr_scheduler._LRScheduler, optim.LRScheduler]
 
@@ -205,7 +209,7 @@ def get_parser():
     parser.add_argument(
         "--num-decoder-layers",
         type=int,
-        default=2,
+        default=3,
         help="""Number of decoder layer of transformer decoder.
         Setting this to 0 will not create the decoder at all (pure CTC model)
         """,
@@ -265,7 +269,7 @@ def get_parser():
     parser.add_argument(
         "--use-fp16",
         type=str2bool,
-        default=False,
+        default=True,
         help="Whether to use half precision training.",
     )
 
@@ -330,21 +334,21 @@ def get_params() -> AttributeDict:
             "best_valid_epoch": -1,
             "batch_idx_train": 0,
             "log_interval": 5,
-            "reset_interval": 10,
-            "valid_interval": 20,  
+            "reset_interval": 200,
+            "valid_interval": 100,
             # parameters for conformer
             "feature_dim": 768,
             "subsampling_factor": 1,
-            "encoder_dim": 256,
+            "encoder_dim": 128,
             "nhead": 8,
             "dim_feedforward": 1024,
-            "num_encoder_layers": 4,
+            "num_encoder_layers": 6,
             # parameters for ctc loss
             "beam_size": 10,
             "reduction": "sum",
             "use_double_scores": True,
             # parameters for Noam
-            "model_warm_step": 200,
+            "model_warm_step": 1000,
             "env_info": get_env_info(),
         }
     )
@@ -466,7 +470,7 @@ def save_checkpoint(
     if params.best_valid_epoch == params.cur_epoch:
         best_valid_filename = params.exp_dir / "best-valid-loss.pt"
         copyfile(src=filename, dst=best_valid_filename)
-        
+
 
 def compute_loss(
     params: AttributeDict,
@@ -475,6 +479,7 @@ def compute_loss(
     graph_compiler: BpeCtcTrainingGraphCompiler,
     is_training: bool,
     warmup: float = 1.0,
+    avmodel: Optional[nn.Module] = None,
 ) -> Tuple[Tensor, MetricsTracker]:
     """
     Compute CTC loss given the model and its inputs.
@@ -501,8 +506,27 @@ def compute_loss(
     device = model.device if isinstance(model, DDP) else next(model.parameters()).device
     feature = batch["inputs"]
     # at entry, feature is (N, T, C)
-    assert feature.ndim == 3
-    feature = feature.to(device)
+    if feature.ndim == 4:  # on-the-fly ROI frames
+
+        assert avmodel is not None, (
+            "on-the-fly ROI frames require the AV-HuBERT feature extractor; "
+            "avmodel was not passed to compute_loss"
+        )
+        feature = feature.float().unsqueeze(1).to(device)
+
+        with torch.no_grad():
+            feature, _ = avmodel.extract_finetune(
+                source={"video": feature, "audio": None},
+                padding_mask=None,
+                output_layer=params.layer,
+            )
+
+    elif feature.ndim == 3:  # precomputed features
+
+        feature = feature.to(device)
+
+    else:
+        raise ValueError(feature.shape)
 
     supervisions = batch["supervisions"]
     feature_lens = supervisions["num_frames"].to(device)
@@ -516,7 +540,7 @@ def compute_loss(
     # different duration in decreasing order, required by
     # `k2.intersect_dense` called in `k2.ctc_loss`
     supervision_segments, texts = encode_supervisions(
-        supervisions, subsampling_factor=1
+        supervisions, subsampling_factor=params.subsampling_factor
     )
 
     if isinstance(graph_compiler, BpeCtcTrainingGraphCompiler):
@@ -562,7 +586,7 @@ def compute_loss(
                 sos_id=graph_compiler.sos_id,
                 eos_id=graph_compiler.eos_id,
             )
-      
+
         loss = (1.0 - params.att_rate) * ctc_loss + params.att_rate * att_loss
     else:
         loss = ctc_loss
@@ -599,6 +623,7 @@ def compute_validation_loss(
     graph_compiler: BpeCtcTrainingGraphCompiler,
     valid_dl: torch.utils.data.DataLoader,
     world_size: int = 1,
+    avmodel: Optional[nn.Module] = None,
 ) -> MetricsTracker:
     """Run the validation process."""
     model.eval()
@@ -612,6 +637,7 @@ def compute_validation_loss(
             batch=batch,
             graph_compiler=graph_compiler,
             is_training=False,
+            avmodel=avmodel,
         )
         assert loss.requires_grad is False
         tot_loss = tot_loss + loss_info
@@ -640,6 +666,7 @@ def train_one_epoch(
     tb_writer: Optional[SummaryWriter] = None,
     world_size: int = 1,
     rank: int = 0,
+    avmodel: Optional[nn.Module] = None,
 ) -> None:
     """Train the model for one epoch.
 
@@ -690,6 +717,7 @@ def train_one_epoch(
                 graph_compiler=graph_compiler,
                 is_training=True,
                 warmup=(params.batch_idx_train / params.model_warm_step),
+                avmodel=avmodel,
             )
         # summary stats
         tot_loss = (tot_loss * (1 - 1 / params.reset_interval)) + loss_info
@@ -704,13 +732,13 @@ def train_one_epoch(
             if "CUDA out of memory" in str(e):
                 logging.error(f"failing batch size:{batch_size} ")
             raise
-        
-        scaler.unscale_(optimizer)
 
-        grad_norm = torch.nn.utils.clip_grad_norm_(
-            model.parameters(), 
-            max_norm=1.0
-        )
+        # scaler.unscale_(optimizer)
+
+        # grad_norm = torch.nn.utils.clip_grad_norm_(
+        #     model.parameters(),
+        #     max_norm=5.0
+        # )
 
         scheduler.step_batch(params.batch_idx_train)
         scaler.step(optimizer)
@@ -766,9 +794,9 @@ def train_one_epoch(
             ):
                 logging.error("Your loss contains inf, something goes wrong")
             if tb_writer is not None:
-                
-                tb_writer.add_scalar("train/grad_norm", grad_norm, params.batch_idx_train)
-                
+                if "grad_norm" in locals():
+                    tb_writer.add_scalar("train/grad_norm", grad_norm, params.batch_idx_train)
+
                 tb_writer.add_scalar(
                     "train/learning_rate", cur_lr, params.batch_idx_train
                 )
@@ -786,6 +814,7 @@ def train_one_epoch(
                 graph_compiler=graph_compiler,
                 valid_dl=valid_dl,
                 world_size=world_size,
+                avmodel=avmodel,
             )
             model.train()
             logging.info(f"Epoch {params.cur_epoch}, validation: {valid_info}")
@@ -815,7 +844,6 @@ def run(rank, world_size, args):
     """
     params = get_params()
     params.update(vars(args))
- 
 
     fix_random_seed(params.seed)
     if world_size > 1:
@@ -882,7 +910,7 @@ def run(rank, world_size, args):
         num_decoder_layers=params.num_decoder_layers,
         dropout=0.1,
         layer_dropout=0.1,
-        dim_feedforward=1024,        
+        dim_feedforward=1024,
     )
 
     print(model)
@@ -907,6 +935,20 @@ def run(rank, world_size, args):
         logging.info("Using DDP")
         model = DDP(model, device_ids=[rank])
 
+    # Load the frozen AV-HuBERT feature extractor once per rank, on this rank's
+    # device. Only needed for on-the-fly ROI -> feature extraction; precomputed
+    # features are already 3-D and skip this path.
+    avmodel = None
+    if params.on_the_fly_feats:
+        # Lazy import: `compute_avhubert_grid` pulls in dlib + fairseq at module
+        # top, so only import it (and add the `local/` dir to sys.path) when the
+        # on-the-fly ROI -> feature extraction path is actually used.
+        local_dir = Path(__file__).resolve().parent.parent / "local"
+        sys.path.insert(0, str(local_dir))
+        from compute_avhubert_grid import load_globals_avbubert
+
+        avmodel = load_globals_avbubert(args)["model"].to(device)
+
     optimizer = Eve(model.parameters(), lr=params.initial_lr)
 
     scheduler = Eden(optimizer, params.lr_batches, params.lr_epochs)
@@ -925,19 +967,16 @@ def run(rank, world_size, args):
 
     if params.print_diagnostics:
         diagnostic = diagnostics.attach_diagnostics(model)
-        
 
     grid = GridAsrDataModule(args)
 
-    cuts = grid.train_all_cuts()   
+    cuts = grid.train_all_cuts()
 
-    train_cuts, valid_cuts = grid.split_train_valid(cuts, 0.03, seed=params.seed)     
-   
+    train_cuts, valid_cuts = grid.split_train_valid(cuts, 0.03, seed=params.seed)
 
     # train_dl = grid.train_dataloaders(train_cuts)
 
     valid_dl = grid.valid_dataloaders(valid_cuts)
-
 
     if params.start_batch > 0 and checkpoints and "sampler" in checkpoints:
         # We only load the sampler's state dict when it loads a checkpoint
@@ -957,6 +996,7 @@ def run(rank, world_size, args):
             optimizer=optimizer,
             graph_compiler=graph_compiler,
             params=params,
+            avmodel=avmodel,
         )
 
     scaler = create_grad_scaler(enabled=params.use_fp16)
@@ -987,6 +1027,7 @@ def run(rank, world_size, args):
             tb_writer=tb_writer,
             world_size=world_size,
             rank=rank,
+            avmodel=avmodel,
         )
 
         if params.print_diagnostics:
@@ -1017,6 +1058,7 @@ def scan_pessimistic_batches_for_oom(
     optimizer: torch.optim.Optimizer,
     graph_compiler: BpeCtcTrainingGraphCompiler,
     params: AttributeDict,
+    avmodel: Optional[nn.Module] = None,
 ):
     from lhotse.dataset import find_pessimistic_batches
 
@@ -1038,6 +1080,7 @@ def scan_pessimistic_batches_for_oom(
                     graph_compiler=graph_compiler,
                     is_training=True,
                     warmup=0.0,
+                    avmodel=avmodel,
                 )
             loss.backward()
             optimizer.step()

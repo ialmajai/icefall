@@ -108,7 +108,7 @@ def _avhubert_on_path(path: Path):
         sys.path.remove(str_path)
 
 
-def load_globals(args: argparse.Namespace):
+def load_globals_avbubert(args: argparse.Namespace):
     """
     Initialise and return all shared resources derived from ``args``.
 
@@ -123,17 +123,9 @@ def load_globals(args: argparse.Namespace):
     with _avhubert_on_path(args.avhubert_code_dir):
         from avhubert.utils import Compose, Normalize
 
-    # Dlib 
-    if not args.dlib_predictor.exists():
-        raise FileNotFoundError(
-            f"dlib landmark model not found: {args.dlib_predictor}\n"
-            "Download: http://dlib.net/files/shape_predictor_68_face_landmarks.dat.bz2"
-        )
-
-    detector  = dlib.get_frontal_face_detector()
-    predictor = dlib.shape_predictor(str(args.dlib_predictor))
-
+    
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    
     logging.info(f"Using device: {device}")
 
     if not args.avhubert_ckpt.exists():
@@ -155,13 +147,34 @@ def load_globals(args: argparse.Namespace):
     ])
 
     return dict(
-        detector=detector,
-        predictor=predictor,
         device=device,
         model=model,
         transform=transform,
     )
 
+def load_globals_dlib(args: argparse.Namespace):
+    """
+    Initialise and return all shared resources derived from ``args``.
+
+    Returns
+    -------
+    dict with keys: avhubert_utils, detector, predictor, device, model, transform
+    """
+    
+    # Dlib 
+    if not args.dlib_predictor.exists():
+        raise FileNotFoundError(
+            f"dlib landmark model not found: {args.dlib_predictor}\n"
+            "Download: http://dlib.net/files/shape_predictor_68_face_landmarks.dat.bz2"
+        )
+
+    detector  = dlib.get_frontal_face_detector()
+    predictor = dlib.shape_predictor(str(args.dlib_predictor))
+
+    return dict(
+        detector=detector,
+        predictor=predictor,
+    )
 
 def extract_features_from_visual(
     video: str,
@@ -229,16 +242,19 @@ def extract_features_from_visual(
         if len(frames) < MIN_FRAMES:
             logging.warning(f"Skipping {video}: only {len(frames)} frames (min {MIN_FRAMES}).")
             return None
+        
+        frames = transform(np.stack(frames))
 
-        np.savez_compressed(mouth_frames_file, frames=np.array(frames, dtype=np.uint8))
+        #np.savez_compressed(mouth_frames_file, frames=np.array(frames, dtype=np.uint8))
+        np.savez_compressed(mouth_frames_file, frames=frames)
         logging.info(f"Saved mouth frames to {mouth_frames_file}.")
 
     if len(frames) < MIN_FRAMES:
         logging.warning(f"Skipping {video}: only {len(frames)} frames (min {MIN_FRAMES}).")
         return None
    
-    frames_np = transform(np.float32(np.stack(frames)))
-    tensor = torch.from_numpy(frames_np).unsqueeze(0).unsqueeze(0).to(device)
+    #frames_np = transform(np.float32(np.stack(frames)))
+    tensor = torch.FloatTensor(frames).unsqueeze(0).unsqueeze(0).to(device)
      # AV-HuBERT feature extraction
     with torch.no_grad():
         features, _ = model.extract_finetune(
@@ -337,7 +353,8 @@ _worker_globals: dict = {}
 def _worker_init(args: argparse.Namespace) -> None:
     """Called once per worker process to load model and detector."""
     global _worker_globals
-    _worker_globals = load_globals(args)
+    _worker_globals = load_globals_avbubert(args)
+    _worker_globals.update(load_globals_dlib(args))
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s %(levelname)s [%(filename)s:%(lineno)d] %(message)s",

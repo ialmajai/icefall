@@ -22,6 +22,7 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Any, Dict, Optional
 
+import cv2
 import torch
 from lhotse import CutSet, load_manifest, load_manifest_lazy
 from lhotse.dataset import (  # noqa F401 for PrecomputedFeatures
@@ -33,11 +34,8 @@ from lhotse.dataset import (  # noqa F401 for PrecomputedFeatures
     SimpleCutSampler,
     SpecAugment,
 )
-from lhotse.dataset.input_strategies import (  # noqa F401 For AudioSamples
-    AudioSamples,
-    OnTheFlyFeatures,
-    BatchIO,
-)
+from lhotse.dataset.input_strategies import BatchIO
+
 from lhotse.utils import fix_random_seed, supervision_to_frames
 from torch.utils.data import DataLoader
 
@@ -45,12 +43,20 @@ from icefall.utils import str2bool
 from dataclasses import replace
 import random
 
+from enum import Enum
+import numpy as np
+
+import torch.nn.functional as F
+import torchvision.transforms.functional as TF
+
+
 class _SeedWorkers:
     def __init__(self, seed: int):
         self.seed = seed
 
     def __call__(self, worker_id: int):
         fix_random_seed(self.seed + worker_id)
+        
 
 class GridAsrDataModule:
     """
@@ -90,7 +96,7 @@ class GridAsrDataModule:
         group.add_argument(
             "--max-duration",
             type=int,
-            default=690,
+            default=300,
             help="Maximum pooled recordings duration (seconds) in a "
             "single batch. You can reduce it if it causes CUDA OOM.",
         )
@@ -125,7 +131,7 @@ class GridAsrDataModule:
         group.add_argument(
             "--gap",
             type=float,
-            default=1.0,
+            default=0.0,
             help="The amount of padding (in seconds) inserted between "
             "concatenated cuts. This padding is filled with noise when "
             "noise augmentation is used.",
@@ -133,7 +139,7 @@ class GridAsrDataModule:
         group.add_argument(
             "--on-the-fly-feats",
             type=str2bool,
-            default=False,
+            default=True,
             help="When enabled, use on-the-fly cut mixing and feature "
             "extraction. Will drop existing precomputed feature manifests "
             "if available.",
@@ -175,7 +181,7 @@ class GridAsrDataModule:
         group.add_argument(
             "--spec-aug-time-warp-factor",
             type=int,
-            default=3,
+            default=0,
             help="Used only when --enable-spec-aug is True. "
             "It specifies the factor for time warping in SpecAugment. "
             "Larger values mean more warping. "
@@ -187,7 +193,28 @@ class GridAsrDataModule:
             default="PrecomputedFeatures",
             help="AudioSamples or PrecomputedFeatures",
         )
- 
+        group.add_argument(
+            "--avhubert-code-dir",
+            type=Path,
+            default="av_hubert",
+            help="Path to the AV-HuBERT source directory (added temporarily to sys.path).",
+        )
+        group.add_argument(
+            "--avhubert-ckpt",
+            type=Path,
+            default="download/avhubert-ckpts/base_vox_iter5.pt",
+            help="Path to the AV-HuBERT pretrained checkpoint (.pt file).",
+        )
+        group.add_argument(
+            "--layer",
+            type=int,
+            default=9,
+            help="Number of encoder layers to keep (0-indexed upper bound). "
+                "Default: %(default)s",
+        )
+    
+    
+    
     def train_dataloaders(
         self,
         cuts_train: CutSet,
@@ -224,21 +251,35 @@ class GridAsrDataModule:
             # In different Lhotse's versions, the default of num_frame_masks is
             # different.
            
-            input_transforms.append(
-                SpecAugment(
-                    time_warp_factor=self.args.spec_aug_time_warp_factor,
-                    num_frame_masks=10,
-                    features_mask_size=128,
-                    num_feature_masks=2,
-                    frames_mask_size=10,
-                )
-            )
+            # input_transforms.append(
+            #     SpecAugment(
+            #         time_warp_factor=self.args.spec_aug_time_warp_factor,
+            #         num_frame_masks=10,
+            #         features_mask_size=1,
+            #         num_feature_masks=1,
+            #         frames_mask_size=25,
+            #     )
+            # )
         else:
             logging.info("Disable SpecAugment")
 
         logging.info("About to create train dataset")
+        if self.args.on_the_fly_feats:
+            # On-the-fly ROI -> feature extraction. Optionally augment the raw
+            # mouth-ROI frames before the AV-HuBERT feature extractor runs.
+            augment = None
+            if self.args.enable_spec_aug:
+                augment = AVHubertAugment()
+
+            input_strategy = VisualFeatureInputStrategy(
+                mode=VisualInputMode.ON_THE_FLY,
+                augment=augment,
+            )
+        else:
+            input_strategy = VisualFeatureInputStrategy()
+
         train = K2SpeechRecognitionDataset(
-            input_strategy=VisualFeatureInputStrategy(),
+            input_strategy=input_strategy,
             cut_transforms=transforms,
             input_transforms=input_transforms,
             return_cuts=self.args.return_cuts,
@@ -358,24 +399,440 @@ class GridAsrDataModule:
         )
         return cuts
 
+
+class AVHubertAugment:
+    """
+    Augmentation pipeline for greyscale lip-ROI sequences (T, H, W) from the GRID corpus.
+
+    Design principles:
+    - All spatial transforms use a single sample per sequence (temporal consistency)
+    - Augmentations are ordered: geometric -> photometric -> temporal -> noise
+    - Every parameter has a sensible default calibrated for 88x88 mouth ROIs
+    - Augmentations are independently gated so ablations are trivial
+    """
+
+    def __init__(
+        self,
+        speed_perturb_prob = 1.0,
+        crop_size: int = 80,
+        flip_prob: float = 0.5,
+        rotation_prob: float = 0.3,
+        rotation_degrees: float = 3.0,
+        time_mask_prob: float = 0.3,
+        time_mask_max_frames: int = 3,
+        time_mask_value: float = 0.0,
+        spatial_mask_prob: float = 0.1,
+        spatial_mask_ratio: float = 0.05,   # fraction of pixels to zero
+        mask_fill_value: float = 0.0,
+        noise_prob: float = 0.1,
+        noise_std: float = 0.12,
+        blur_prob: float = 0.05,
+        blur_kernel_size: int = 3,
+        output_size: int = 88,
+        mustache_prob: float = 0.0
+    ):
+        assert crop_size < output_size, "crop_size must be < output_size"
+        self.speed_perturb_prob = speed_perturb_prob
+        self.crop_size = crop_size
+        self.flip_prob = flip_prob
+        self.rotation_prob = rotation_prob
+        self.rotation_degrees = rotation_degrees
+
+        self.time_mask_prob = time_mask_prob
+        self.time_mask_max_frames = time_mask_max_frames
+        self.time_mask_value = time_mask_value
+
+        self.spatial_mask_prob = spatial_mask_prob
+        self.spatial_mask_ratio = spatial_mask_ratio
+        self.mask_fill_value = mask_fill_value
+        
+        self.noise_prob = noise_prob
+        self.noise_std = noise_std
+
+        self.blur_prob = blur_prob
+        # torchvision requires odd kernel size
+        self.blur_kernel_size = blur_kernel_size if blur_kernel_size % 2 == 1 else blur_kernel_size + 1
+
+        self.output_size = output_size
+        self.mustache_prob = mustache_prob
+        
+    def _rotate(self, frames: torch.Tensor) -> torch.Tensor:
+        angle = random.uniform(-self.rotation_degrees, self.rotation_degrees)
+        # unsqueeze to (T, 1, H, W) for TF.rotate, then squeeze back
+        rotated = TF.rotate(
+            frames.unsqueeze(1),
+            angle=angle,
+            interpolation=TF.InterpolationMode.BILINEAR,
+            fill=0.0,
+        ).squeeze(1)
+        return rotated
+
+    def _random_crop_resize(self, frames: torch.Tensor) -> torch.Tensor:
+        """Consistent crop across all frames, then resize back."""
+        T, H, W = frames.shape
+        top  = torch.randint(0, H - self.crop_size + 1, (1,)).item()
+        left = torch.randint(0, W - self.crop_size + 1, (1,)).item()
+        frames = frames[:, top:top + self.crop_size, left:left + self.crop_size]
+        # (T, 1, H, W) for torchvision resize then back to (T, H, W)
+        frames = TF.resize(
+            frames.unsqueeze(1),
+            [self.output_size, self.output_size],
+            antialias=True,
+        ).squeeze(1)
+        return frames
+
+    def _horizontal_flip(self, frames: torch.Tensor) -> torch.Tensor:
+        return torch.flip(frames, dims=[2])
+
+
+    def _gaussian_blur(self, frames: torch.Tensor) -> torch.Tensor:
+        """Apply identical blur to every frame."""
+        k = self.blur_kernel_size
+        sigma = random.uniform(0.3, 0.6)
+        # TF.gaussian_blur expects (C,H,W); process as (T,1,H,W) batch trick
+        blurred = TF.gaussian_blur(
+            frames.unsqueeze(1), kernel_size=[k, k], sigma=sigma
+        ).squeeze(1)
+        return blurred
+
+    def _time_masking(self, frames: torch.Tensor) -> torch.Tensor:
+        """
+        SpecAugment-style masking along the time axis.
+        Masks a contiguous block of frames with a constant fill value.
+        Applied at most once per sequence.
+        """
+        T = frames.shape[0]
+        mask_len = torch.randint(1, self.time_mask_max_frames + 1, (1,)).item()
+        mask_len = min(mask_len, T)
+        start = torch.randint(0, T - mask_len + 1, (1,)).item()
+        frames = frames.clone()
+        frames[start:start + mask_len] = self.time_mask_value
+        return frames
+
+    def _spatial_mask(self, frames: torch.Tensor) -> torch.Tensor:
+        """
+        Randomly zero a fixed fraction of spatial positions,
+        using the same mask for all frames in the sequence.
+        Encourages the model not to over-rely on any single pixel region.
+        """
+        T, H, W = frames.shape
+        n_pixels = H * W
+        n_masked = int(n_pixels * self.spatial_mask_ratio)
+        idx = torch.randperm(n_pixels)[:n_masked]
+        frames = frames.clone().reshape(T, -1)
+        frames[:, idx] = self.mask_fill_value
+        return frames.reshape(T, H, W)
+    
+    def _speed_perturb(
+        self,
+        frames: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Simulate speed change by dropping or duplicating frames
+        at regular intervals. Avoids interpolation blur.
+        Output is always T frames.
+
+        The rate factor is drawn from {0.85, 0.9, 1.0, 1.1, 1.15}; 1.0 is a
+        no-op. Factors < 1.0 resample to fewer frames, then duplicate evenly
+        spaced frames to pad back to T; factors > 1.0 resample to more frames,
+        then drop evenly spaced frames to trim back to T. Examples (T=75):
+
+        0.85x: resample to 64 frames, then duplicate 11 evenly spaced -> 75
+        0.9x : resample to 68 frames, then duplicate 7  evenly spaced -> 75
+        1.1x : resample to 82 frames, then drop      7  evenly spaced -> 75
+        1.15x: resample to 86 frames, then drop      11 evenly spaced -> 75
+        """
+        T, H, W = frames.shape
+        factor = random.choice([0.85, 0.9, 1.0, 1.1, 1.15])
+
+        if factor == 1.0:
+            return frames
+
+        new_T = round(T * factor)
+
+        # resample to new_T via nearest neighbour (no interpolation blur)
+        indices = torch.linspace(0, T - 1, new_T).round().long().clamp(0, T - 1)
+        frames = frames[indices]   # (new_T, H, W)
+
+        if new_T < T:
+            # faster speech: new_T=68, need to duplicate T - new_T = 7 frames
+            # pick evenly spaced positions to insert duplicates
+            n_dup = T - new_T
+            dup_positions = torch.linspace(0, new_T - 1, n_dup).round().long()
+            insert_frames = frames[dup_positions]                    # (n_dup, H, W)
+            frames = torch.cat([frames, insert_frames], dim=0)      # (T, H, W)
+            # sort is not strictly necessary but keeps temporal order coherent
+            order = torch.cat([
+                torch.arange(new_T),
+                dup_positions,
+            ]).argsort(stable=True)
+            frames = frames[order]
+
+        elif new_T > T:
+            # slower speech: new_T=83, need to drop new_T - T = 8 frames
+            # drop evenly spaced positions
+            n_drop = new_T - T
+            drop_positions = torch.linspace(
+                0, new_T - 1, n_drop
+            ).round().long()
+            keep_mask = torch.ones(new_T, dtype=torch.bool)
+            keep_mask[drop_positions] = False
+            frames = frames[keep_mask]                               # (T, H, W)
+
+        assert frames.shape[0] == T, f"Expected {T} frames, got {frames.shape[0]}"
+        return frames
+
+    def _gaussian_noise(self, frames: torch.Tensor) -> torch.Tensor:
+        return (frames + torch.randn_like(frames) * self.noise_std)
+    
+    def _landmarks_to_roi(
+        self,
+        landmarks: np.ndarray,      # (T, 68, 2) or (68, 2) full face coords
+        mouth_w: int,               # same values used in _extract_mouth_frames
+        mouth_h: int,
+        roi_size: tuple,  # (88, 88)
+    ) -> np.ndarray:
+        """
+        Transform full-face landmark coordinates into the cropped+resized
+        ROI pixel space that the augmented frames live in.
+        """
+        lm = landmarks  # (T, 68, 2) or (68, 2)
+
+        # compute crop centre per frame (or single frame)
+        cx = ((lm[..., 48, 0] + lm[..., 54, 0]) / 2)  # (...,)
+        cy = ((lm[..., 48, 1] + lm[..., 54, 1]) / 2)
+
+        # top-left corner of crop box (before resize), same logic as extraction
+        x1 = cx - mouth_w // 2   # (...,)
+        y1 = cy - mouth_h // 2
+
+        # scale factors from crop box to roi_size
+        scale_x = roi_size[0] / mouth_w
+        scale_y = roi_size[1] / mouth_h
+
+        # transform all 68 points
+        roi_lm = lm.copy().astype(float)
+        roi_lm[..., 0] = (lm[..., 0] - x1[..., None]) * scale_x
+        roi_lm[..., 1] = (lm[..., 1] - y1[..., None]) * scale_y
+
+        return roi_lm   # same shape as input, now in ROI pixel space
+    
+    def _mustache_occlusion(
+        self,
+        frames: torch.Tensor,
+        landmarks: np.ndarray,      # (T, 68, 2) already in ROI pixel space
+    ) -> torch.Tensor:
+        """
+        Renders a curved moustache shape anchored to dlib lip landmarks.
+        Uses a quadratic bezier curve to define the upper boundary,
+        giving a natural arch shape rather than a rectangular patch.
+        """
+        T, H, W = frames.shape
+        frames = frames.clone()
+
+        # stable anchors via median across frames to suppress dlib jitter
+        upper_lip_row = int(np.median(landmarks[:, 51, 1]))  # cupid bow centre
+        left_col      = int(np.median(landmarks[:, 48, 0]))  # left lip corner
+        right_col     = int(np.median(landmarks[:, 54, 0]))  # right lip corner
+
+        if not (0 < upper_lip_row < H):
+            return frames
+
+        # slight random vertical offset so it sits just above the lip
+        v_offset  = random.randint(1, 3)
+        bot_row   = max(0, upper_lip_row - v_offset)
+
+        # moustache height: how thick it is vertically
+        moustache_h = random.randint(5, 9)
+        top_row_centre = max(0, bot_row - moustache_h)
+
+        # narrow inside lip corners
+        margin    = random.randint(2, 4)
+        left_col  = max(0, left_col + margin)
+        right_col = min(W, right_col - margin)
+
+        if left_col >= right_col or top_row_centre >= bot_row:
+            return frames
+
+        # ------------------------------------------------------------------
+        # Build a moustache mask using a filled bezier polygon
+        # Upper boundary: quadratic bezier curving upward in the centre
+        # Lower boundary: straight line along bot_row
+        # ------------------------------------------------------------------
+        mid_col = (left_col + right_col) // 2
+
+        # control point for upper bezier: arches upward by arch_height pixels
+        arch_height = random.randint(3, 6)
+        p0 = np.array([left_col,  bot_row],             dtype=np.float32)
+        p1 = np.array([mid_col,   top_row_centre - arch_height], dtype=np.float32)
+        p2 = np.array([right_col, bot_row],             dtype=np.float32)
+
+        # sample bezier curve points
+        n_points = 30
+        t_vals = np.linspace(0, 1, n_points)
+        bezier_pts = np.array([
+            (1 - t)**2 * p0 + 2 * (1 - t) * t * p1 + t**2 * p2
+            for t in t_vals
+        ]).astype(np.int32)   # (n_points, 2) in (x, y) / (col, row) order
+
+        # polygon: upper bezier curve + lower straight line closing the shape
+        lower_left  = np.array([[left_col,  bot_row]], dtype=np.int32)
+        lower_right = np.array([[right_col, bot_row]], dtype=np.int32)
+        polygon = np.concatenate([
+            bezier_pts,
+            lower_right,
+            lower_left,
+        ], axis=0)   # (n_points+2, 2)
+
+        # render filled mask
+        mask = np.zeros((H, W), dtype=np.uint8)
+        cv2.fillPoly(mask, [polygon], color=255)
+        mask_bool = torch.from_numpy(mask).bool()   # (H, W)
+
+        # ------------------------------------------------------------------
+        # Dark grey fill in normalised space
+        # your data range is approx [-1.6, 1.3]
+        # dark grey sits around -0.5 to -0.8 (not as dark as -1.2 which is black)
+        # ------------------------------------------------------------------
+        fill_base = random.uniform(-0.8, -0.5)
+        noise     = torch.randn(T, H, W, dtype=frames.dtype) * 0.04
+
+        fill_tensor = torch.full((T, H, W), fill_base, dtype=frames.dtype) + noise
+
+        # apply mask across all frames
+        mask_expanded = mask_bool.unsqueeze(0).expand(T, -1, -1)  # (T, H, W)
+        frames[mask_expanded] = fill_tensor[mask_expanded]
+
+        return frames
+
+    def __call__(self, frames: torch.Tensor, landmarks: np.ndarray) -> torch.Tensor:
+        """
+        Args:
+            frames: (T, H, W) float tensor, mean/std normalised, approx range [-1.6, 1.3]
+            landmarks: (T, 68, 2) or (68, 2) xy coordinates in the ROI pixel space
+        """
+
+        # Occlusion first: the landmarks are in the original ROI pixel space,
+        # so the moustache must be rendered before any geometric transform
+        # (flip / rotate / crop-resize) moves the frames out of that space.
+        if landmarks is not None and torch.rand(1).item() < self.mustache_prob:
+            frames = self._mustache_occlusion(frames, landmarks)
+
+        if torch.rand(1).item() < self.speed_perturb_prob:
+            frames = self._speed_perturb(frames)
+
+        if torch.rand(1).item() < self.flip_prob:
+            frames = self._horizontal_flip(frames)
+
+        # Rotate
+        if torch.rand(1).item() < self.rotation_prob:
+            frames = self._rotate(frames)
+
+        # Geometric
+        frames = self._random_crop_resize(frames)
+
+        if torch.rand(1).item() < self.blur_prob:
+            frames = self._gaussian_blur(frames)
+
+        # Temporal masking
+        if torch.rand(1).item() < self.time_mask_prob:
+            frames = self._time_masking(frames)
+
+        # Spatial masking
+        if torch.rand(1).item() < self.spatial_mask_prob:
+            frames = self._spatial_mask(frames)
+
+        # Noise 
+        if torch.rand(1).item() < self.noise_prob:
+            frames = self._gaussian_noise(frames)
+
+        return frames
+
+
+class VisualInputMode(str, Enum):
+    PRECOMPUTED = "precomputed"
+    ON_THE_FLY = "on_the_fly"
+
+
 class VisualFeatureInputStrategy(BatchIO):
-    def __init__(self, frame_shift: float = 0.04):
+    def __init__(
+        self,
+        frame_shift: float = 0.04,
+        mode: str = VisualInputMode.PRECOMPUTED,
+        augment=None,
+    ):
         super().__init__()
         self.frame_shift = frame_shift
+        self.mode = mode
+        self.augment = augment
+
+    def _load_precomputed_features(self, cut):
+        return torch.from_numpy(
+            cut.load_custom("video_features")
+        ).float()
+
+    def _load_mouth_frames(self, cut):
+        video_path = Path(cut.recording.sources[0].source)
+        roi_file = video_path.with_suffix(".mouth_frames.npz")
+
+        frames = np.load(roi_file)["frames"]  # (T,H,W)
+
+        frames = torch.FloatTensor(frames)
         
+       
+
+
+        if self.augment is not None:
+            landmark_path = video_path.with_suffix(".landmarks.npz")
+            landmarks = np.load(landmark_path)["landmarks"]
+            
+            roi_landmarks = self.augment._landmarks_to_roi(
+                landmarks,
+                mouth_w   = 64,    # same values used during preprocessing
+                mouth_h   = 64,
+                roi_size  = (88, 88),
+            )
+                
+            frames = self.augment(frames, roi_landmarks)
+
+        return frames
+    
     def __call__(self, cuts):
-        feats = [torch.from_numpy(cut.load_custom("video_features")).float() for cut in cuts]
-        lengths = torch.tensor([f.shape[0] for f in feats], dtype=torch.int32)
-        feats = torch.nn.utils.rnn.pad_sequence(feats, batch_first=True)
-        return feats, lengths
-      
+
+        if self.mode == VisualInputMode.PRECOMPUTED:
+            inputs = [
+                self._load_precomputed_features(cut)
+                for cut in cuts
+            ]
+
+        elif self.mode == VisualInputMode.ON_THE_FLY:
+            inputs = [
+                self._load_mouth_frames(cut)
+                for cut in cuts
+            ]           
+            
+        else:
+            raise ValueError(f"Unknown mode: {self.mode}")
+
+        lengths = torch.tensor(
+            [x.shape[0] for x in inputs],
+            dtype=torch.int32,
+        )
+
+        inputs = torch.nn.utils.rnn.pad_sequence(
+            inputs,
+            batch_first=True,
+        )
+
+        return inputs, lengths
+
     @property
     def extractor(self):
         class DummyExtractor:
             def __init__(self, frame_shift):
                 self.frame_shift = frame_shift
         return DummyExtractor(self.frame_shift)
-
+    
     def supervision_intervals(self, cuts: CutSet) -> Dict[str, torch.Tensor]:
         start_frames, nums_frames, sequence_idx = [], [], []
         for i, cut in enumerate(cuts):
