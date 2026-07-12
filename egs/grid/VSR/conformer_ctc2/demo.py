@@ -51,6 +51,7 @@ import argparse
 import logging
 import math
 import sys
+import time
 from pathlib import Path
 
 import numpy as np
@@ -103,8 +104,6 @@ def _median_iod(landmarks: np.ndarray) -> float:
 
 # Shown in the UI so users know what a valid GRID sentence looks like.
 GRID_GRAMMAR_MD = """
-### Valid GRID sentence structure
-
 Every GRID sentence follows a fixed 6-word grammar:
 
 **command · colour · preposition · letter · digit · adverb**
@@ -123,14 +122,13 @@ Example: **place green with h eight now**
 
 # Shown in the UI (GDPR Art. 13 information for volunteers).
 PRIVACY_NOTICE_MD = """
-### Privacy notice
-
 **Who is collecting**: Ibrahim Almajai, independent researcher
 (i.almajai@gmail.com).
 
-**What & why**: If — and only if — you tick the consent box, two things are
-saved on the server: the cropped mouth-region frames extracted from your clip,
-and the clip's audio track. They are used for lipreading (VSR) and
+**What & why**: If — and only if — you tick the consent box, a single video
+file is saved on the server containing the cropped mouth-region frames
+extracted from your clip and the clip's audio track. It is used for
+lipreading (VSR) and
 audio-visual speech recognition research, where the audio provides
 ground-truth supervision and alignment for the visual data. The full video is
 never stored; uploaded clips are processed in temporary files that are
@@ -149,6 +147,27 @@ to your data protection authority.
 
 This demo is intended for adults (18+).
 """
+
+# Per-visitor (IP) daily usage quotas for the UI. Kept in memory only, so a
+# server restart clears the counters. IP-based counting is a courtesy limit
+# for volunteers, not a security boundary (shared NATs pool their quota).
+QUOTA_WINDOW_S = 24 * 3600
+
+_usage_log = {}  # (ip, source) -> submission timestamps within the window
+
+
+def _quota_exceeded(ip: str, source: str, limit: int) -> bool:
+    """Record one use and report whether the (ip, source) daily limit is hit."""
+    now = time.time()
+    key = (ip, source)
+    recent = [t for t in _usage_log.get(key, []) if now - t < QUOTA_WINDOW_S]
+    if len(recent) >= limit:
+        _usage_log[key] = recent
+        return True
+    recent.append(now)
+    _usage_log[key] = recent
+    return False
+
 
 # Attribution shown in the UI footer (GRID is CC BY 4.0 -> attribution due).
 ACKNOWLEDGEMENTS_MD = """
@@ -576,62 +595,60 @@ def _frames_to_mp4(frames: np.ndarray, fps: int = 25, scale: int = 3, out_dir=No
     return out
 
 
-def _frames_to_gif(frames: np.ndarray, fps: int = 25, scale: int = 3, out_dir=None):
-    """Encode grayscale ROI frames (T,H,W uint8) to an animated GIF (Pillow),
-    nearest-neighbour upscaled by `scale`. Returns the path to a temp .gif."""
-    import tempfile
-
-    from PIL import Image
-
-    _, H, W = frames.shape
-    imgs = [
-        Image.fromarray(f, mode="L").resize((W * scale, H * scale), Image.NEAREST)
-        for f in frames
-    ]
-    out = tempfile.NamedTemporaryFile(suffix=".gif", delete=False, dir=out_dir).name
-    imgs[0].save(
-        out, save_all=True, append_images=imgs[1:],
-        duration=int(1000 / fps), loop=0,
-    )
-    return out
-
-
 def _save_roi_data(roi: np.ndarray, video: str, save_dir: Path) -> str:
-    """Save the extracted mouth-ROI frames (T,H,W uint8) as a timestamped .npz
-    plus the clip's audio track as a .wav with the same stem. The full face
-    video is never stored. Note the audio is voice, i.e. potentially
-    identifying data -- both files are saved only with the user's explicit
-    consent, and the shared stem is the ID users quote to request deletion.
-    Returns that ID."""
-    import shutil
+    """Save the consented data as a single timestamped roi_<stamp>.mp4: the
+    mouth-ROI frames (T,H,W uint8) as pixel-exact lossless grayscale H.264 at
+    25 fps, muxed with the clip's audio track (AAC; omitted automatically if
+    the clip has none). The full face video is never stored. Note the audio is
+    voice, i.e. potentially identifying data -- the file is saved only with
+    the user's explicit consent, and its stem is the ID users quote to request
+    deletion. Returns that ID."""
     import subprocess
     from datetime import datetime
 
     save_dir.mkdir(parents=True, exist_ok=True)
     stamp = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
     stem = f"roi_{stamp}"
-    np.savez_compressed(save_dir / f"{stem}.npz", frames=roi.astype(np.uint8))
-    wav = save_dir / f"{stem}.wav"
-    if shutil.which("ffmpeg") is None:
-        logging.warning(f"ffmpeg unavailable; audio track of {stem} not saved.")
-    else:
-        p = subprocess.run(
-            ["ffmpeg", "-y", "-i", video, "-vn", "-acodec", "pcm_s16le", str(wav)],
-            capture_output=True,
+    dst = save_dir / f"{stem}.mp4"
+    T, H, W = roi.shape
+    cmd = [
+        "ffmpeg", "-y",
+        "-f", "rawvideo", "-pix_fmt", "gray", "-s", f"{W}x{H}",
+        "-r", f"{TARGET_FPS:g}", "-i", "pipe:0",
+        "-i", video,
+        "-map", "0:v", "-map", "1:a?",
+        "-c:v", "libx264", "-qp", "0", "-pix_fmt", "gray",
+        "-c:a", "aac", "-b:a", "192k",
+        str(dst),
+    ]
+    p = subprocess.run(
+        cmd, input=np.ascontiguousarray(roi, dtype=np.uint8).tobytes(),
+        capture_output=True,
+    )
+    if p.returncode != 0:
+        dst.unlink(missing_ok=True)
+        raise RuntimeError(
+            f"ffmpeg failed to save consented data: {p.stderr.decode()[-200:]}"
         )
-        if p.returncode != 0:  # e.g. the clip has no audio track
-            wav.unlink(missing_ok=True)
-            logging.warning(f"No audio saved for {stem} (no track/ffmpeg failed).")
-    logging.info(f"Saved consented data with ID {stem} to {save_dir}")
+    logging.info(f"Saved consented data with ID {stem} to {dst}")
     return stem
 
 
-def launch_ui(reader: LipReader, example_paths=None):
+def launch_ui(reader: LipReader, example_paths=None,
+              upload_limit=5, webcam_limit=20):
     import gradio as gr
 
-    def infer(video, consent):
+    def infer(video, consent, source, request: gr.Request):
         if not video:
-            return None, "", None, None, None, None, ""
+            return None, "", None, None, None, ""
+        ip = request.client.host if request and request.client else "unknown"
+        limit = webcam_limit if source == "webcam" else upload_limit
+        if _quota_exceeded(ip, source, limit):
+            kind = "webcam recordings" if source == "webcam" else "file uploads"
+            raise gr.Error(
+                f"Daily limit reached ({limit} {kind} per visitor). "
+                "Please try again tomorrow."
+            )
         try:
             text, roi, word_confs = reader.recognize(video)
         except Exception as e:
@@ -639,7 +656,11 @@ def launch_ui(reader: LipReader, example_paths=None):
             raise gr.Error(f"Recognition failed: {e}")
         saved_id = ""
         if consent:
-            saved_id = _save_roi_data(roi, video, reader.save_dir)
+            try:
+                saved_id = _save_roi_data(roi, video, reader.save_dir)
+            except Exception:
+                logging.exception("Saving consented data failed")
+                gr.Warning("Saving your data failed; nothing was stored.")
         out_dir = _new_request_dir()
         return (
             _to_playable_mp4(video, out_dir),
@@ -653,8 +674,6 @@ def launch_ui(reader: LipReader, example_paths=None):
                 for w, c in word_confs
             ] or None,
             _frames_to_mp4(roi, out_dir=out_dir),
-            # GIF slower than real-time, easier to read.
-            _frames_to_gif(roi, fps=10, out_dir=out_dir),
             roi_strip(roi),
             saved_id,
         )
@@ -668,20 +687,39 @@ def launch_ui(reader: LipReader, example_paths=None):
             continue
         examples.append([_to_playable_mp4(str(pth)) or str(pth)])
 
+    # Only the input component has a .source-selection bar (upload/webcam
+    # icons); keep it un-clipped and its icons comfortably visible.
+    css = """
+    .source-selection { height: var(--size-12) !important; flex-shrink: 0; }
+    .source-selection .icon { width: 30px !important; height: 30px !important; }
+    """
     # delete_cache purges gradio's upload/output cache (every hour, files
     # older than an hour) -- gradio never cleans it on its own.
     with gr.Blocks(
-        title="GRID Lipreading (VSR) Demo", delete_cache=(3600, 3600)
+        title="GRID Lipreading (VSR) Demo", delete_cache=(3600, 3600), css=css
     ) as demo:
         gr.Markdown("# GRID Lipreading (VSR) Demo")
         gr.Markdown(
             "AV-HuBERT visual features → Conformer-CTC. "
-            "Upload a frontal talking-face video "
-            f"({MIN_DURATION_S:g}–{MAX_DURATION_S:g} s)."
+            "Upload or record a frontal talking-face video "
+            f"({MIN_DURATION_S:g}–{MAX_DURATION_S:g} s). "
+            f"Daily limit per visitor: {upload_limit} file uploads, "
+            f"{webcam_limit} webcam recordings."
         )
         with gr.Row():
             with gr.Column():
-                video_in = gr.Video(label="Frontal talking-face clip")
+                video_in = gr.Video(
+                    label="Frontal talking-face clip", height=290
+                )
+                # Where the current clip came from ("upload"/"webcam"), for
+                # the per-source quota; set by the upload/record events below.
+                source_state = gr.State("upload")
+                if examples:
+                    gr.Examples(
+                        examples=examples, inputs=[video_in],
+                        label="Example clips (click, then Submit)",
+                    )
+                submit = gr.Button("Submit", variant="primary")
                 save_cb = gr.Checkbox(
                     label="I consent to the cropped mouth-region frames and "
                           "the clip's audio track being saved on the server "
@@ -696,16 +734,17 @@ def launch_ui(reader: LipReader, example_paths=None):
                 )
                 with gr.Accordion("Privacy notice", open=False):
                     gr.Markdown(PRIVACY_NOTICE_MD)
-                submit = gr.Button("Submit", variant="primary")
-                if examples:
-                    gr.Examples(
-                        examples=examples, inputs=[video_in],
-                        label="Example clips (click, then Submit)",
-                    )
-                # Static, always visible (before and after submit), under submit.
-                gr.Markdown(GRID_GRAMMAR_MD)
+                with gr.Accordion("Valid GRID sentence structure", open=False):
+                    gr.Markdown(GRID_GRAMMAR_MD)
             with gr.Column():
-                playback = gr.Video(label="Playback (transcoded to mp4)")
+                with gr.Row():
+                    playback = gr.Video(
+                        label="Playback (transcoded to mp4)", height=240
+                    )
+                    roi_vid = gr.Video(
+                        label="Mouth ROI (animated)",
+                        show_download_button=False, height=240,
+                    )
                 text_out = gr.Textbox(label="Recognised text")
                 conf_out = gr.HighlightedText(
                     label="Word confidence",
@@ -713,13 +752,9 @@ def launch_ui(reader: LipReader, example_paths=None):
                     show_inline_category=False,
                     show_legend=False,
                 )
-                roi_vid = gr.Video(
-                    label="Mouth ROI (animated)", show_download_button=True,
-                    height=200, width=200,
-                )
-                gif_out = gr.File(label="Download ROI animation (GIF)")
                 strip_out = gr.Image(
-                    label="Mouth ROI (sampled frames)", image_mode="L"
+                    label="Mouth ROI (sampled frames)", image_mode="L",
+                    height=140, show_download_button=False,
                 )
         gr.Markdown(ACKNOWLEDGEMENTS_MD)
 
@@ -731,14 +766,17 @@ def launch_ui(reader: LipReader, example_paths=None):
                 err = _duration_error(video)
                 if err:
                     gr.Warning(err)
-                    return None
-            return video
+                    return None, "upload"
+            return video, "upload"
 
-        video_in.upload(check_length, inputs=[video_in], outputs=[video_in])
+        video_in.upload(
+            check_length, inputs=[video_in], outputs=[video_in, source_state]
+        )
+        video_in.stop_recording(lambda: "webcam", outputs=[source_state])
         submit.click(
             infer,
-            inputs=[video_in, save_cb],
-            outputs=[playback, text_out, conf_out, roi_vid, gif_out, strip_out,
+            inputs=[video_in, save_cb, source_state],
+            outputs=[playback, text_out, conf_out, roi_vid, strip_out,
                      saved_out],
         )
     # Abort oversized transfers during upload; 100 MB covers any legitimate
@@ -776,16 +814,22 @@ def get_args() -> argparse.Namespace:
                         "the mouth-to-head ratio matches GRID for arbitrary "
                         "videos. No-op for GRID-sized faces. Default: %(default)s")
     p.add_argument("--save-dir", type=Path, default=Path("demo_saved"),
-                   help="Server-side dir where mouth-ROI data (.npz) and the "
-                        "clip's audio track (.wav) are saved when the user "
-                        "ticks the consent box. The full video is never "
-                        "stored. Default: %(default)s")
+                   help="Server-side dir where consented data is saved: one "
+                        ".mp4 per clip (lossless mouth-ROI video + audio "
+                        "track). The full video is never stored. "
+                        "Default: %(default)s")
     # Model geometry -- must match the trained checkpoint.
     p.add_argument("--encoder-dim", type=int, default=128)
     p.add_argument("--num-encoder-layers", type=int, default=6)
     p.add_argument("--num-decoder-layers", type=int, default=3)
     p.add_argument("--ui", action="store_true",
                    help="Launch the Gradio web UI instead of CLI.")
+    p.add_argument("--max-uploads-per-day", type=int, default=5,
+                   help="UI quota: file-upload submissions allowed per "
+                        "visitor (IP) per day.")
+    p.add_argument("--max-webcam-per-day", type=int, default=20,
+                   help="UI quota: webcam-recording submissions allowed per "
+                        "visitor (IP) per day.")
     p.add_argument("--examples", type=Path, nargs="*",
                    default=[Path("grid-corpus/s1/bbaf2n.mpg"),
                             Path("grid-corpus/s33/bbac1s.mpg")],
@@ -805,7 +849,8 @@ def main():
     reader = LipReader(args)
 
     if args.ui:
-        launch_ui(reader, args.examples)
+        launch_ui(reader, args.examples,
+                  args.max_uploads_per_day, args.max_webcam_per_day)
     else:
         if args.video is None:
             raise SystemExit("Provide a video path, or pass --ui for the web UI.")
