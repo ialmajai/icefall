@@ -78,10 +78,10 @@ BLANK_ID = 0  # icefall CTC blank
 TARGET_FPS = 25.0  # GRID / AV-HuBERT frame rate; other rates are resampled
 # Accepted clip length. Below the minimum no GRID-style sentence fits; above
 # the maximum, per-frame landmarking would tie up the demo for too long.
-# The tolerance keeps nominally-3s clips (e.g. 74-frame GRID clips, 2.96s)
-# from being rejected over metadata rounding.
-MIN_DURATION_S = 3.0
-MAX_DURATION_S = 30.0
+# The tolerance keeps nominal-length clips from being rejected over container
+# metadata rounding.
+MIN_DURATION_S = 2.0
+MAX_DURATION_S = 15.0
 DURATION_TOL_S = 0.1
 
 # Head-size normalization. GRID has uniform framing: its fixed 64px mouth crop
@@ -148,6 +148,18 @@ You may also request a copy of the data, and you have the right to complain
 to your data protection authority.
 
 This demo is intended for adults (18+).
+"""
+
+# Attribution shown in the UI footer (GRID is CC BY 4.0 -> attribution due).
+ACKNOWLEDGEMENTS_MD = """
+---
+**Acknowledgements**: This research demo uses the
+[GRID audiovisual sentence corpus](https://spandh.dcs.shef.ac.uk/gridcorpus/)
+(Cooke, Barker, Cunningham & Shao, 2006; CC BY 4.0) and Meta's
+[AV-HuBERT](https://github.com/facebookresearch/av_hubert) visual front-end
+(Shi et al., 2022; non-commercial research license), and is built with
+[icefall](https://github.com/k2-fsa/icefall) / k2 and
+[dlib](http://dlib.net/) facial landmarks.
 """
 
 # HLG lattice-decoding hyper-parameters (from decode.py get_params()).
@@ -409,16 +421,9 @@ class LipReader:
 
         word_confs is a list of (word, confidence in [0, 1]) pairs; it may be
         empty when confidences could not be derived."""
-        duration = _video_duration(video)
-        if duration and not (
-            MIN_DURATION_S - DURATION_TOL_S
-            <= duration
-            <= MAX_DURATION_S + DURATION_TOL_S
-        ):
-            raise ValueError(
-                f"Clip is {duration:.1f}s long; please use a clip between "
-                f"{MIN_DURATION_S:g}s and {MAX_DURATION_S:g}s."
-            )
+        err = _duration_error(video)
+        if err:
+            raise ValueError(err)
         roi, feats = self._roi_and_features(video)
         feature = feats.unsqueeze(0).to(self.device)  # (1, T, 768)
         nnet_output = self.model(feature, None)[0]  # (1, T, C)
@@ -451,6 +456,22 @@ def _video_duration(video: str) -> float:
         return frames / fps if fps > 0 and frames > 0 else 0.0
     finally:
         cap.release()
+
+
+def _duration_error(video: str):
+    """Rejection message if the clip's length is outside the accepted range,
+    None if acceptable (or the duration is unknown)."""
+    duration = _video_duration(video)
+    if duration and not (
+        MIN_DURATION_S - DURATION_TOL_S
+        <= duration
+        <= MAX_DURATION_S + DURATION_TOL_S
+    ):
+        return (
+            f"Clip is {duration:.1f}s long; please use a clip between "
+            f"{MIN_DURATION_S:g}s and {MAX_DURATION_S:g}s."
+        )
+    return None
 
 
 def _resample_to_target_fps(src: str):
@@ -647,7 +668,11 @@ def launch_ui(reader: LipReader, example_paths=None):
             continue
         examples.append([_to_playable_mp4(str(pth)) or str(pth)])
 
-    with gr.Blocks(title="GRID Lipreading (VSR) Demo") as demo:
+    # delete_cache purges gradio's upload/output cache (every hour, files
+    # older than an hour) -- gradio never cleans it on its own.
+    with gr.Blocks(
+        title="GRID Lipreading (VSR) Demo", delete_cache=(3600, 3600)
+    ) as demo:
         gr.Markdown("# GRID Lipreading (VSR) Demo")
         gr.Markdown(
             "AV-HuBERT visual features → Conformer-CTC. "
@@ -683,7 +708,7 @@ def launch_ui(reader: LipReader, example_paths=None):
                 playback = gr.Video(label="Playback (transcoded to mp4)")
                 text_out = gr.Textbox(label="Recognised text")
                 conf_out = gr.HighlightedText(
-                    label="Word confidence (CTC posterior)",
+                    label="Word confidence",
                     color_map={"high": "green", "medium": "yellow", "low": "red"},
                     show_inline_category=False,
                     show_legend=False,
@@ -696,13 +721,29 @@ def launch_ui(reader: LipReader, example_paths=None):
                 strip_out = gr.Image(
                     label="Mouth ROI (sampled frames)", image_mode="L"
                 )
+        gr.Markdown(ACKNOWLEDGEMENTS_MD)
+
+        def check_length(video):
+            """Reject out-of-range clips as soon as they are uploaded, before
+            Submit: warn and clear the input. recognize() re-checks as a
+            backstop for the CLI/API path."""
+            if video:
+                err = _duration_error(video)
+                if err:
+                    gr.Warning(err)
+                    return None
+            return video
+
+        video_in.upload(check_length, inputs=[video_in], outputs=[video_in])
         submit.click(
             infer,
             inputs=[video_in, save_cb],
             outputs=[playback, text_out, conf_out, roi_vid, gif_out, strip_out,
                      saved_out],
         )
-    demo.launch()
+    # Abort oversized transfers during upload; 100 MB covers any legitimate
+    # clip within the accepted duration (a 15 s 4K phone video is ~100-200 MB).
+    demo.launch(max_file_size="100mb")
 
 
 def get_args() -> argparse.Namespace:
