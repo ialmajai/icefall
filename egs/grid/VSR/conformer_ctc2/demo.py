@@ -739,7 +739,8 @@ def launch_ui(reader: LipReader, example_paths=None,
             with gr.Column():
                 with gr.Row():
                     playback = gr.Video(
-                        label="Playback (transcoded to mp4)", height=240
+                        label="Playback (transcoded to mp4)", height=240,
+                        show_download_button=False,
                     )
                     roi_vid = gr.Video(
                         label="Mouth ROI (animated)",
@@ -835,7 +836,7 @@ def get_args() -> argparse.Namespace:
                         "visitor (IP) per day.")
     p.add_argument("--examples", type=Path, nargs="*",
                    default=[Path("grid-corpus/s1/bbaf2n.mpg"),
-                            Path("grid-corpus/s33/bbac1s.mpg")],
+                            Path("s7_l_lwwm7p.mov")],
                    help="Example clips offered in the UI (missing files are "
                         "skipped). Pass no paths to disable.")
     p.add_argument("video", nargs="?", default=None,
