@@ -3,9 +3,11 @@
 #
 # Isolation: the container sees the conda env and the icefall repo read-only,
 # can write only to demo_saved/ (consented data) and its private tmpfs /tmp,
-# runs as the invoking (non-root) user with all capabilities dropped, and the
-# UI is published on 127.0.0.1 only (put cloudflared/a proxy in front for
-# public access).
+# and runs as the invoking (non-root) user with all capabilities dropped. It
+# lives on the internal-only 'vsr-net' network: no internet egress, no LAN
+# access, no published host port -- the only way in is the cloudflared
+# container (run_tunnel.sh), which joins the same network and proxies
+# https://demo.ibrahimalmajai.com to http://vsr-demo:7860.
 #
 # Runs detached with a restart policy, so the demo survives crashes and
 # reboots (the docker daemon is boot-enabled). Stop for good with:
@@ -15,9 +17,12 @@ cd "$(dirname "$0")/.."  # egs/grid/VSR
 
 docker build -q -t vsr-demo demo_docker
 
+docker network inspect vsr-net >/dev/null 2>&1 || \
+    docker network create --internal vsr-net
 mkdir -p demo_saved
 docker rm -f vsr-demo >/dev/null 2>&1 || true
 exec docker run -d --restart unless-stopped --name vsr-demo \
+    --network vsr-net \
     --gpus all \
     --user "$(id -u):$(id -g)" \
     --read-only --tmpfs /tmp:size=2g \
@@ -26,7 +31,6 @@ exec docker run -d --restart unless-stopped --name vsr-demo \
     -v /data/miniconda3/envs/icefall-vsr:/data/miniconda3/envs/icefall-vsr:ro \
     -v /data/icefall:/data/icefall:ro \
     -v "$PWD/demo_saved:/data/icefall/egs/grid/VSR/demo_saved" \
-    -p 127.0.0.1:7860:7860 \
     vsr-demo \
     python conformer_ctc2/demo.py --ui \
         --checkpoint conformer_ctc2/exp32/pretrained.pt \
