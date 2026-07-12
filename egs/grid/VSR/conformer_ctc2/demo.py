@@ -76,6 +76,13 @@ MOUTH_LEFT, MOUTH_RIGHT = 48, 54  # dlib 68-point landmark indices
 MOUTH_W = MOUTH_H = 64
 BLANK_ID = 0  # icefall CTC blank
 TARGET_FPS = 25.0  # GRID / AV-HuBERT frame rate; other rates are resampled
+# Accepted clip length. Below the minimum no GRID-style sentence fits; above
+# the maximum, per-frame landmarking would tie up the demo for too long.
+# The tolerance keeps nominally-3s clips (e.g. 74-frame GRID clips, 2.96s)
+# from being rejected over metadata rounding.
+MIN_DURATION_S = 3.0
+MAX_DURATION_S = 30.0
+DURATION_TOL_S = 0.1
 
 # Head-size normalization. GRID has uniform framing: its fixed 64px mouth crop
 # corresponds to a median interocular distance (IOD) of ~50.6px. For arbitrary
@@ -373,6 +380,16 @@ class LipReader:
 
         word_confs is a list of (word, confidence in [0, 1]) pairs; it may be
         empty when confidences could not be derived."""
+        duration = _video_duration(video)
+        if duration and not (
+            MIN_DURATION_S - DURATION_TOL_S
+            <= duration
+            <= MAX_DURATION_S + DURATION_TOL_S
+        ):
+            raise ValueError(
+                f"Clip is {duration:.1f}s long; please use a clip between "
+                f"{MIN_DURATION_S:g}s and {MAX_DURATION_S:g}s."
+            )
         roi, feats = self._roi_and_features(video)
         feature = feats.unsqueeze(0).to(self.device)  # (1, T, 768)
         nnet_output = self.model(feature, None)[0]  # (1, T, C)
@@ -390,6 +407,19 @@ def _video_fps(video: str) -> float:
     cap = cv2.VideoCapture(video)
     try:
         return cap.get(cv2.CAP_PROP_FPS) or 0.0
+    finally:
+        cap.release()
+
+
+def _video_duration(video: str) -> float:
+    """Duration in seconds from container metadata (0.0 if unknown)."""
+    import cv2
+
+    cap = cv2.VideoCapture(video)
+    try:
+        fps = cap.get(cv2.CAP_PROP_FPS) or 0.0
+        frames = cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0.0
+        return frames / fps if fps > 0 and frames > 0 else 0.0
     finally:
         cap.release()
 
@@ -574,7 +604,8 @@ def launch_ui(reader: LipReader, example_paths=None):
         gr.Markdown("# GRID Lipreading (VSR) Demo")
         gr.Markdown(
             "AV-HuBERT visual features → Conformer-CTC. "
-            "Upload a frontal talking-face video."
+            "Upload a frontal talking-face video "
+            f"({MIN_DURATION_S:g}–{MAX_DURATION_S:g} s)."
         )
         with gr.Row():
             with gr.Column():
