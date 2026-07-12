@@ -6,13 +6,18 @@
 # runs as the invoking (non-root) user with all capabilities dropped, and the
 # UI is published on 127.0.0.1 only (put cloudflared/a proxy in front for
 # public access).
+#
+# Runs detached with a restart policy, so the demo survives crashes and
+# reboots (the docker daemon is boot-enabled). Stop for good with:
+#   docker rm -f vsr-demo
 set -euo pipefail
 cd "$(dirname "$0")/.."  # egs/grid/VSR
 
 docker build -q -t vsr-demo demo_docker
 
 mkdir -p demo_saved
-exec docker run --rm --name vsr-demo \
+docker rm -f vsr-demo >/dev/null 2>&1 || true
+exec docker run -d --restart unless-stopped --name vsr-demo \
     --gpus all \
     --user "$(id -u):$(id -g)" \
     --read-only --tmpfs /tmp:size=2g \
