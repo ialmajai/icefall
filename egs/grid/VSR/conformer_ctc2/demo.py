@@ -121,6 +121,35 @@ Every GRID sentence follows a fixed 6-word grammar:
 Example: **place green with h eight now**
 """
 
+# Shown in the UI (GDPR Art. 13 information for volunteers).
+PRIVACY_NOTICE_MD = """
+### Privacy notice
+
+**Who is collecting**: Ibrahim Almajai, independent researcher
+(i.almajai@gmail.com).
+
+**What & why**: If — and only if — you tick the consent box, two things are
+saved on the server: the cropped mouth-region frames extracted from your clip,
+and the clip's audio track. They are used for lipreading (VSR) and
+audio-visual speech recognition research, where the audio provides
+ground-truth supervision and alignment for the visual data. The full video is
+never stored; uploaded clips are processed in temporary files that are
+routinely deleted. Be aware that a voice recording may identify you.
+
+**Record alone**: please record by yourself in a quiet room — the microphone
+also captures other people's voices, and they cannot consent through this
+form.
+
+**Retention**: Saved data is deleted at most 12 months after collection.
+
+**Your rights**: You can withdraw consent and have your data deleted at any
+time: email the *Saved data ID* shown after submitting to the address above.
+You may also request a copy of the data, and you have the right to complain
+to your data protection authority.
+
+This demo is intended for adults (18+).
+"""
+
 # HLG lattice-decoding hyper-parameters (from decode.py get_params()).
 SEARCH_BEAM = 20
 OUTPUT_BEAM = 4
@@ -546,18 +575,34 @@ def _frames_to_gif(frames: np.ndarray, fps: int = 25, scale: int = 3, out_dir=No
     return out
 
 
-def _save_roi_data(roi: np.ndarray, save_dir: Path) -> Path:
-    """Save only the extracted mouth-ROI frames (T,H,W uint8) as a timestamped
-    .npz. The full face video is never stored -- just the anonymized mouth
-    region, saved only with the user's explicit consent."""
+def _save_roi_data(roi: np.ndarray, video: str, save_dir: Path) -> str:
+    """Save the extracted mouth-ROI frames (T,H,W uint8) as a timestamped .npz
+    plus the clip's audio track as a .wav with the same stem. The full face
+    video is never stored. Note the audio is voice, i.e. potentially
+    identifying data -- both files are saved only with the user's explicit
+    consent, and the shared stem is the ID users quote to request deletion.
+    Returns that ID."""
+    import shutil
+    import subprocess
     from datetime import datetime
 
     save_dir.mkdir(parents=True, exist_ok=True)
     stamp = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
-    dst = save_dir / f"roi_{stamp}.npz"
-    np.savez_compressed(dst, frames=roi.astype(np.uint8))
-    logging.info(f"Saved mouth-ROI data to {dst}")
-    return dst
+    stem = f"roi_{stamp}"
+    np.savez_compressed(save_dir / f"{stem}.npz", frames=roi.astype(np.uint8))
+    wav = save_dir / f"{stem}.wav"
+    if shutil.which("ffmpeg") is None:
+        logging.warning(f"ffmpeg unavailable; audio track of {stem} not saved.")
+    else:
+        p = subprocess.run(
+            ["ffmpeg", "-y", "-i", video, "-vn", "-acodec", "pcm_s16le", str(wav)],
+            capture_output=True,
+        )
+        if p.returncode != 0:  # e.g. the clip has no audio track
+            wav.unlink(missing_ok=True)
+            logging.warning(f"No audio saved for {stem} (no track/ffmpeg failed).")
+    logging.info(f"Saved consented data with ID {stem} to {save_dir}")
+    return stem
 
 
 def launch_ui(reader: LipReader, example_paths=None):
@@ -565,14 +610,15 @@ def launch_ui(reader: LipReader, example_paths=None):
 
     def infer(video, consent):
         if not video:
-            return None, "", None, None, None, None
+            return None, "", None, None, None, None, ""
         try:
             text, roi, word_confs = reader.recognize(video)
         except Exception as e:
             logging.exception(f"Recognition failed for {video}")
             raise gr.Error(f"Recognition failed: {e}")
+        saved_id = ""
         if consent:
-            _save_roi_data(roi, reader.save_dir)
+            saved_id = _save_roi_data(roi, video, reader.save_dir)
         out_dir = _new_request_dir()
         return (
             _to_playable_mp4(video, out_dir),
@@ -589,6 +635,7 @@ def launch_ui(reader: LipReader, example_paths=None):
             # GIF slower than real-time, easier to read.
             _frames_to_gif(roi, fps=10, out_dir=out_dir),
             roi_strip(roi),
+            saved_id,
         )
 
     # Example clips: GRID .mpg won't play in the browser, so show a transcoded
@@ -611,11 +658,19 @@ def launch_ui(reader: LipReader, example_paths=None):
             with gr.Column():
                 video_in = gr.Video(label="Frontal talking-face clip")
                 save_cb = gr.Checkbox(
-                    label="I consent to my anonymized mouth-ROI data being "
-                          "saved on the server. The full video is never stored "
-                          "— only the cropped mouth region.",
+                    label="I consent to the cropped mouth-region frames and "
+                          "the clip's audio track being saved on the server "
+                          "for lipreading and audio-visual speech research. "
+                          "The full video is not stored; note that a voice "
+                          "recording may be identifying.",
                     value=False,
                 )
+                saved_out = gr.Textbox(
+                    label="Saved data ID (quote this to request deletion)",
+                    interactive=False,
+                )
+                with gr.Accordion("Privacy notice", open=False):
+                    gr.Markdown(PRIVACY_NOTICE_MD)
                 submit = gr.Button("Submit", variant="primary")
                 if examples:
                     gr.Examples(
@@ -644,7 +699,8 @@ def launch_ui(reader: LipReader, example_paths=None):
         submit.click(
             infer,
             inputs=[video_in, save_cb],
-            outputs=[playback, text_out, conf_out, roi_vid, gif_out, strip_out],
+            outputs=[playback, text_out, conf_out, roi_vid, gif_out, strip_out,
+                     saved_out],
         )
     demo.launch()
 
@@ -679,9 +735,10 @@ def get_args() -> argparse.Namespace:
                         "the mouth-to-head ratio matches GRID for arbitrary "
                         "videos. No-op for GRID-sized faces. Default: %(default)s")
     p.add_argument("--save-dir", type=Path, default=Path("demo_saved"),
-                   help="Server-side dir where mouth-ROI data (.npz) is saved "
-                        "when the user ticks the consent box. The full video is "
-                        "never stored. Default: %(default)s")
+                   help="Server-side dir where mouth-ROI data (.npz) and the "
+                        "clip's audio track (.wav) are saved when the user "
+                        "ticks the consent box. The full video is never "
+                        "stored. Default: %(default)s")
     # Model geometry -- must match the trained checkpoint.
     p.add_argument("--encoder-dim", type=int, default=128)
     p.add_argument("--num-encoder-layers", type=int, default=6)
