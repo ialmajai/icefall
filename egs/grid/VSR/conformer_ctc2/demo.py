@@ -779,6 +779,9 @@ def launch_ui(reader: LipReader, example_paths=None,
             outputs=[playback, text_out, conf_out, roi_vid, strip_out,
                      saved_out],
         )
+    # One GPU inference at a time with a bounded waiting line (visitors see
+    # their queue position); protects the server when the demo is public.
+    demo.queue(default_concurrency_limit=1, max_size=10)
     # Abort oversized transfers during upload; 100 MB covers any legitimate
     # clip within the accepted duration (a 15 s 4K phone video is ~100-200 MB).
     demo.launch(max_file_size="100mb")
