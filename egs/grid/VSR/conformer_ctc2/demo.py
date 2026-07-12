@@ -125,7 +125,7 @@ PRIVACY_NOTICE_MD = """
 **Who is collecting**: Ibrahim Almajai, independent researcher
 (i.almajai@gmail.com).
 
-**What & why**: If — and only if — you tick the consent box, a single video
+**What & why**: If, and only if, you tick the consent box, a single video
 file is saved on the server containing the cropped mouth-region frames
 extracted from your clip and the clip's audio track. It is used for
 lipreading (VSR) and
@@ -134,9 +134,9 @@ ground-truth supervision and alignment for the visual data. The full video is
 never stored; uploaded clips are processed in temporary files that are
 routinely deleted. Be aware that a voice recording may identify you.
 
-**Record alone**: please record by yourself in a quiet room — the microphone
-also captures other people's voices, and they cannot consent through this
-form.
+**Record alone**: please record by yourself in a quiet room, because the
+microphone also captures other people's voices, and they cannot consent
+through this form.
 
 **Retention**: Saved data is deleted at most 12 months after collection.
 
