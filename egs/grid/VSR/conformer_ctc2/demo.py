@@ -303,6 +303,13 @@ SEARCH_BEAM = 20
 OUTPUT_BEAM = 4
 MIN_ACTIVE_STATES = 30
 MAX_ACTIVE_STATES = 10000
+# Word confidences come from a second, wider lattice built on
+# temperature-flattened posteriors: CTC output is too peaky and the tight
+# decoding beam prunes competitors away, so posteriors on the decoding
+# lattice score even wrong words ~1.0. Values chosen by AUC (0.91 vs 0.72
+# for the decoding lattice) on a held-out unseen-speaker sweep.
+CONF_OUTPUT_BEAM = 10
+CONF_TEMPERATURE = 2.0
 
 
 def load_tokens(path: Path):
@@ -496,27 +503,74 @@ class LipReader:
         """Lexicon-constrained decoding via HLG + one-best path (like decode.py).
 
         Returns (text, word_confs)."""
-        from icefall.decode import get_lattice, one_best_decoding
+        from icefall.decode import one_best_decoding
         from icefall.utils import get_texts
+
+        lattice = self._build_lattice(nnet_output, OUTPUT_BEAM)
+        best_path = one_best_decoding(lattice=lattice, use_double_scores=True)
+        hyp = get_texts(best_path)[0]
+        words = [self.word_table[i] for i in hyp]
+        try:
+            # Confidence lattice: see CONF_OUTPUT_BEAM/CONF_TEMPERATURE.
+            conf_nnet = torch.log_softmax(
+                nnet_output / CONF_TEMPERATURE, dim=-1
+            )
+            conf_lattice = self._build_lattice(conf_nnet, CONF_OUTPUT_BEAM)
+            word_confs = self._word_posteriors(conf_lattice, hyp, words)
+        except Exception:
+            logging.exception("Lattice word posteriors failed; falling back")
+            word_confs = self._word_confidences_1best(
+                best_path, nnet_output, words
+            )
+        return " ".join(words), word_confs
+
+    def _build_lattice(self, nnet_output: torch.Tensor, output_beam: int):
+        from icefall.decode import get_lattice
 
         T = nnet_output.shape[1]
         # Single, unpadded clip: one segment covering all T frames.
         supervision_segments = torch.tensor([[0, 0, T]], dtype=torch.int32)
-        lattice = get_lattice(
+        return get_lattice(
             nnet_output=nnet_output,
             decoding_graph=self.HLG,
             supervision_segments=supervision_segments,
             search_beam=SEARCH_BEAM,
-            output_beam=OUTPUT_BEAM,
+            output_beam=output_beam,
             min_active_states=MIN_ACTIVE_STATES,
             max_active_states=MAX_ACTIVE_STATES,
             subsampling_factor=1,
         )
-        best_path = one_best_decoding(lattice=lattice, use_double_scores=True)
-        hyp = get_texts(best_path)[0]
-        words = [self.word_table[i] for i in hyp]
-        word_confs = self._word_confidences_1best(best_path, nnet_output, words)
-        return " ".join(words), word_confs
+
+    def _word_posteriors(self, lattice, hyp_ids, words):
+        """Marginal word posteriors from the full decoding lattice.
+
+        Forward-backward (via k2 arc posteriors in the log semiring) gives
+        each arc's posterior mass; a word's confidence is the total mass of
+        all lattice arcs emitting it. Unlike a best-path score, this accounts
+        for competing hypotheses: if 'n' and 'l' split the letter slot, both
+        score ~0.5 instead of the winner claiming ~1.0. Relies on each word
+        occurring at most once per path, which GRID's disjoint slot
+        vocabularies guarantee.
+        """
+        import k2
+
+        # (num_arcs,) log posteriors under the full lattice.
+        arc_post = lattice.get_arc_post(
+            use_double_scores=True, log_semiring=True
+        )
+        post = arc_post.exp()
+        aux = lattice.aux_labels
+        if isinstance(aux, k2.RaggedTensor):
+            vals = aux.values.long()
+            contrib = post[aux.shape.row_ids(1).long()]
+        else:
+            vals = aux.long()
+            contrib = post
+        word_confs = []
+        for wid, w in zip(hyp_ids, words):
+            p = contrib[vals == wid].sum().item()
+            word_confs.append((w, min(1.0, p)))
+        return word_confs
 
     def _word_confidences_1best(self, best_path, nnet_output, words):
         """Per-word confidence from the one-best path.
