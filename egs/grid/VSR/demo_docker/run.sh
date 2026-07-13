@@ -21,7 +21,7 @@ docker network inspect vsr-net >/dev/null 2>&1 || \
     docker network create --internal vsr-net
 mkdir -p demo_saved
 docker rm -f vsr-demo >/dev/null 2>&1 || true
-exec docker run -d --restart unless-stopped --name vsr-demo \
+docker run -d --restart unless-stopped --name vsr-demo \
     --network vsr-net \
     --gpus all \
     --user "$(id -u):$(id -g)" \
@@ -40,3 +40,10 @@ exec docker run -d --restart unless-stopped --name vsr-demo \
         --words-file data/lang_bpe_58/words.txt \
         --avhubert-ckpt download/avhubert-ckpts/base_vox_iter5.pt \
         "$@"
+
+# Operator access from this machine, quota-exempt (private-IP requests
+# bypass the per-visitor limits; public traffic arrives via Cloudflare
+# with a public Cf-Connecting-IP and is limited as usual).
+sleep 2
+IP=$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' vsr-demo)
+echo "Local (quota-exempt) URL: http://${IP}:7860  (public: https://demo.ibrahimalmajai.com)"

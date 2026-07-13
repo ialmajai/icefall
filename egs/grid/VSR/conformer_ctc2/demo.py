@@ -99,6 +99,24 @@ GRID_IOD_REF = 50.6
 CROP_PER_IOD = MOUTH_W / GRID_IOD_REF  # ~1.264
 
 
+def _degrade_roi(roi: np.ndarray, noise_sigma: float,
+                 blur_sigma: float) -> np.ndarray:
+    """Optionally blur then add Gaussian noise to ROI frames (T,H,W uint8),
+    for the UI's robustness playground. Blur first: camera blur precedes
+    sensor noise in a real pipeline."""
+    import cv2
+
+    out = roi.astype(np.float32)
+    if blur_sigma > 0:
+        out = np.stack(
+            [cv2.GaussianBlur(f, (0, 0), blur_sigma) for f in out]
+        )
+    if noise_sigma > 0:
+        rng = np.random.default_rng()
+        out = out + rng.normal(0.0, noise_sigma, out.shape)
+    return np.clip(out, 0, 255).astype(np.uint8)
+
+
 def _median_iod(landmarks: np.ndarray) -> float:
     """Median interocular distance (px) across frames from dlib 68 landmarks."""
     lm = landmarks.astype(float)
@@ -163,6 +181,34 @@ This demo is intended for adults (18+).
 QUOTA_WINDOW_S = 24 * 3600
 
 _usage_log = {}  # (ip, source) -> submission timestamps within the window
+
+
+def _client_ip(request) -> str:
+    """Real visitor IP. Behind the Cloudflare tunnel the TCP peer is the
+    cloudflared container, so trust Cf-Connecting-IP (set by Cloudflare's
+    edge), then X-Forwarded-For, before falling back to the socket peer."""
+    if request is None:
+        return "unknown"
+    headers = getattr(request, "headers", None) or {}
+    ip = headers.get("cf-connecting-ip", "")
+    if not ip:
+        ip = headers.get("x-forwarded-for", "").split(",")[0].strip()
+    if not ip and getattr(request, "client", None):
+        ip = request.client.host
+    return ip or "unknown"
+
+
+def _is_local_ip(ip: str) -> bool:
+    """True for loopback/private addresses. Public traffic always arrives
+    with a Cloudflare-set public IP, so a private address means the request
+    came from the host machine itself (the operator): exempt from quotas."""
+    import ipaddress
+
+    try:
+        addr = ipaddress.ip_address(ip)
+    except ValueError:
+        return False
+    return addr.is_loopback or addr.is_private
 
 
 def _quota_exceeded(ip: str, source: str, limit: int) -> bool:
@@ -373,7 +419,8 @@ class LipReader:
                 f"Loaded HLG from {args.HLG} and words from {args.words_file}"
             )
 
-    def _roi_and_features(self, video: str):
+    def _roi_and_features(self, video: str, noise_sigma: float = 0.0,
+                          blur_sigma: float = 0.0):
         """Return (raw ROI frames (T,88,88) uint8, AV-HuBERT features (T,768))."""
         # Temporal normalization: the model was trained on 25 fps GRID video,
         # so resample other frame rates (e.g. 30/60 fps uploads) before
@@ -392,13 +439,16 @@ class LipReader:
                 logging.info(f"Resampled {video}: {fps:.2f} -> {TARGET_FPS:g} fps")
         try:
             return self._roi_and_features_25fps(
-                video, Path(resampled) if resampled else Path(video)
+                video, Path(resampled) if resampled else Path(video),
+                noise_sigma, blur_sigma,
             )
         finally:
             if resampled is not None:
                 Path(resampled).unlink(missing_ok=True)
 
-    def _roi_and_features_25fps(self, video: str, video_path: Path):
+    def _roi_and_features_25fps(self, video: str, video_path: Path,
+                                noise_sigma: float = 0.0,
+                                blur_sigma: float = 0.0):
         """`_roi_and_features` body; video_path is the (possibly resampled)
         clip to process, video the original name for messages."""
         landmarks = _detect_landmarks(
@@ -430,6 +480,8 @@ class LipReader:
             video_path, landmarks, crop, crop, ROI_SIZE, MOUTH_LEFT, MOUTH_RIGHT
         )
         roi = np.stack(raw)  # (T, 88, 88) uint8
+        if noise_sigma or blur_sigma:  # robustness playground
+            roi = _degrade_roi(roi, noise_sigma, blur_sigma)
         frames = self.transform(roi)  # normalized float (T, 88, 88)
         tensor = torch.FloatTensor(frames).unsqueeze(0).unsqueeze(0).to(self.device)
         with torch.no_grad():
@@ -513,15 +565,16 @@ class LipReader:
         return word_confs
 
     @torch.no_grad()
-    def recognize(self, video: str):
-        """Return (recognised_text, raw ROI frames, word_confs).
+    def recognize(self, video: str, noise_sigma: float = 0.0,
+                  blur_sigma: float = 0.0):
+        """Return (recognised_text, ROI frames as recognized, word_confs).
 
         word_confs is a list of (word, confidence in [0, 1]) pairs; it may be
         empty when confidences could not be derived."""
         err = _duration_error(video)
         if err:
             raise ValueError(err)
-        roi, feats = self._roi_and_features(video)
+        roi, feats = self._roi_and_features(video, noise_sigma, blur_sigma)
         feature = feats.unsqueeze(0).to(self.device)  # (1, T, 768)
         nnet_output = self.model(feature, None)[0]  # (1, T, C)
         if self.method == "1best":
@@ -748,15 +801,15 @@ def launch_ui(reader: LipReader, example_paths=None,
               upload_limit=2, webcam_limit=5):
     import gradio as gr
 
-    def infer(video, consent, source, request: gr.Request):
+    def infer(video, consent, source, noise, blur, request: gr.Request):
         # Last two slots: Submit interactivity and the input video itself
         # (cleared when the clip was the problem, kept otherwise).
         blank = ("", None, None, None, "")
         if not video:
             return (*blank, gr.update(interactive=False), gr.update())
-        ip = request.client.host if request and request.client else "unknown"
+        ip = _client_ip(request)
         limit = webcam_limit if source == "webcam" else upload_limit
-        if _quota_exceeded(ip, source, limit):
+        if not _is_local_ip(ip) and _quota_exceeded(ip, source, limit):
             kind = "webcam recordings" if source == "webcam" else "file uploads"
             gr.Warning(
                 f"Daily limit reached ({limit} {kind} per visitor). "
@@ -765,7 +818,7 @@ def launch_ui(reader: LipReader, example_paths=None,
             # Nothing wrong with the clip; keep it loaded.
             return (*blank, gr.update(interactive=False), gr.update())
         try:
-            return _infer(video, consent, source)
+            return _infer(video, consent, source, noise, blur)
         except gr.Error as e:
             # Surface the explanation as a toast WITHOUT raising: raising
             # stamps a red "Error" badge on every output component. The
@@ -782,9 +835,10 @@ def launch_ui(reader: LipReader, example_paths=None,
             )
             return (*blank, gr.update(), None)
 
-    def _infer(video, consent, source):
+    def _infer(video, consent, source, noise=0.0, blur=0.0):
+        degraded = bool(noise or blur)
         try:
-            text, roi, word_confs = reader.recognize(video)
+            text, roi, word_confs = reader.recognize(video, noise, blur)
         except Exception as e:
             logging.exception(f"Recognition failed for {video}")
             raise gr.Error(f"Recognition failed: {e}")
@@ -795,6 +849,10 @@ def launch_ui(reader: LipReader, example_paths=None,
             if _file_sig(video) in example_sigs:
                 gr.Info("Example clips are never saved: they are corpus "
                         "data, not yours to donate.")
+            elif degraded:
+                # Noise/blur-corrupted crops would pollute the dataset.
+                gr.Info("Degraded runs (noise/blur) are not saved; set both "
+                        "sliders to 0 to donate data.")
             else:
                 try:
                     saved_id = _save_roi_data(roi, video, reader.save_dir)
@@ -802,7 +860,10 @@ def launch_ui(reader: LipReader, example_paths=None,
                     logging.exception("Saving consented data failed")
                     gr.Warning("Saving your data failed; nothing was stored.")
         try:
-            _log_usage(reader.save_dir, source, _video_duration(video),
+            log_source = source + (
+                f"(noise={noise:g},blur={blur:g})" if degraded else ""
+            )
+            _log_usage(reader.save_dir, log_source, _video_duration(video),
                        text, saved_id)
         except OSError:
             logging.exception("Writing usage.log failed")  # non-fatal
@@ -853,18 +914,40 @@ def launch_ui(reader: LipReader, example_paths=None,
     footer { display: none !important; }
     /* Hide the video trim (scissors) control on the input player. */
     button[aria-label="Trim video to selection"] { display: none !important; }
+    /* Hide the persistent in-component "Error" status pill (client-side
+       upload/processing failures); toasts still explain what went wrong.
+       Scoped to component status overlays so error toasts are unaffected. */
+    .wrap .error { display: none !important; }
+    """
+    # Client-side upload/processing failures leave a component stuck in an
+    # error state the server cannot see or reset. Auto-click its clear (X)
+    # control so the upload area snaps back to the normal drop zone; the
+    # matching CSS above hides the transient "Error" pill.
+    js = """
+    () => {
+      const resetErrored = () => {
+        document.querySelectorAll('.block .error').forEach(err => {
+          const block = err.closest('.block');
+          if (!block) return;
+          // The X is an icon button nested inside the .clear-status div;
+          // clicking the div itself does nothing.
+          const btn = block.querySelector('.clear-status button')
+                   || block.querySelector('button.clear-status');
+          if (btn) btn.click();
+        });
+      };
+      resetErrored();
+      new MutationObserver(resetErrored)
+        .observe(document.body, {subtree: true, childList: true});
+    }
     """
     # delete_cache purges gradio's upload/output cache (every hour, files
     # older than an hour) -- gradio never cleans it on its own.
     with gr.Blocks(
-        title="GRID Lipreading (VSR) Demo", delete_cache=(3600, 3600), css=css
+        title="Can AI Read Your Lips? A Live Lipreading Demo",
+        delete_cache=(3600, 3600), css=css, js=js,
     ) as demo:
-        gr.Markdown("# GRID Lipreading (VSR) Demo")
-        gr.Markdown(
-            "AV-HuBERT visual features → Conformer-CTC. "
-            "Upload or record a frontal talking-face video "
-            f"({MIN_DURATION_S:g}–{MAX_DURATION_S:g} s)."
-        )
+        gr.Markdown("# Can AI Read Your Lips? A Live Lipreading Demo")
         with gr.Row():
             with gr.Column():
                 video_in = gr.Video(
@@ -877,9 +960,21 @@ def launch_ui(reader: LipReader, example_paths=None,
                     gr.Examples(
                         examples=examples, inputs=[video_in],
                         label="Example clips from speakers unseen in "
-                              "training: s1, s2, s20, s22 "
-                              "(click, then Submit)",
+                              "training: s1, s2, s20, s22 & one from "
+                              "Lombard Grid corpus (click, then Submit)",
                     )
+                with gr.Accordion("Robustness playground (optional)",
+                                  open=False):
+                    gr.Markdown(
+                        "Degrade the mouth crop before recognition to see "
+                        "how performance holds up (the ROI panels show what "
+                        "the model received). Applied after face tracking; "
+                        "0 = off. Degraded runs are never saved."
+                    )
+                    noise_sl = gr.Slider(0, 50, value=0, step=1,
+                                         label="Gaussian noise (σ)")
+                    blur_sl = gr.Slider(0, 5, value=0, step=0.25,
+                                        label="Gaussian blur (σ, pixels)")
                 # Enabled only while an unsubmitted clip is loaded: off at
                 # start, on when the input changes, off again after infer.
                 submit = gr.Button("Submit", variant="primary",
@@ -970,9 +1065,16 @@ def launch_ui(reader: LipReader, example_paths=None,
             outputs=[submit, text_out, conf_out, roi_vid, strip_out,
                      saved_out],
         )
+        # Changing the degradation makes re-submitting the same clip a new
+        # experiment, so it re-enables Submit (if a clip is loaded).
+        for slider in (noise_sl, blur_sl):
+            slider.change(
+                lambda v: gr.update(interactive=v is not None),
+                inputs=[video_in], outputs=[submit],
+            )
         submit.click(
             infer,
-            inputs=[video_in, save_cb, source_state],
+            inputs=[video_in, save_cb, source_state, noise_sl, blur_sl],
             outputs=[text_out, conf_out, roi_vid, strip_out, saved_out,
                      submit, video_in],
         )
@@ -1034,7 +1136,8 @@ def get_args() -> argparse.Namespace:
                    default=[Path("grid-corpus/s1/bbaf2n.mpg"),
                             Path("grid-corpus/s2/sgbp4s.mpg"),
                             Path("grid-corpus/s20/pgwj3p.mpg"),
-                            Path("grid-corpus/s22/srwaza.mpg")],
+                            Path("grid-corpus/s22/srwaza.mpg"),
+                            Path("s3_l_lgin3a.mov")],
                    help="Example clips offered in the UI (missing files are "
                         "skipped). Pass no paths to disable.")
     p.add_argument("video", nargs="?", default=None,
