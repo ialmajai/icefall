@@ -200,7 +200,7 @@ def _grammar_fst_svg() -> str:
         ("command", ["bin", "lay", "place", "set"]),
         ("colour", ["blue", "green", "red", "white"]),
         ("preposition", ["at", "by", "in", "with"]),
-        ("letter (a–z, no w)", ["a", "b", "…", "z"]),
+        ("letter (no w)", ["a", "b", "…", "z"]),
         ("digit", ["zero", "one", "…", "nine"]),
         ("adverb", ["again", "now", "please", "soon"]),
     ]
@@ -212,7 +212,7 @@ def _grammar_fst_svg() -> str:
         cx = (x1 + x2) // 2
         parts.append(
             f'<text x="{cx}" y="28" text-anchor="middle" font-weight="bold" '
-            f'font-size="16" fill="currentColor">{title}</text>'
+            f'font-size="20" fill="currentColor">{title}</text>'
         )
         for a, w in zip(apexes, words):
             dash = ' stroke-dasharray="4 4"' if w == "…" else ""
@@ -221,10 +221,10 @@ def _grammar_fst_svg() -> str:
                 f'fill="none" stroke="currentColor" stroke-opacity="0.45" '
                 f'marker-end="url(#arr)"{dash}/>'
             )
-            ty = y + a + (-8 if a < 0 else 16)
+            ty = y + a + (-10 if a < 0 else 20)
             parts.append(
                 f'<text x="{cx}" y="{ty}" text-anchor="middle" '
-                f'font-size="15" fill="currentColor">{w}</text>'
+                f'font-size="19" fill="currentColor">{w}</text>'
             )
     for i in range(len(slots) + 1):
         x = x0 + i * seg_w
@@ -238,7 +238,7 @@ def _grammar_fst_svg() -> str:
                 f'stroke="currentColor" stroke-width="2"/>'
             )
         parts.append(
-            f'<text x="{x}" y="{y + 5}" text-anchor="middle" font-size="12" '
+            f'<text x="{x}" y="{y + 5}" text-anchor="middle" font-size="14" '
             f'fill="currentColor">{i}</text>'
         )
     return (
@@ -406,7 +406,11 @@ class LipReader:
             detect_height=DETECT_HEIGHT,
         )
         if landmarks is None:
-            raise RuntimeError(f"No face detected in {video}")
+            logging.warning(f"No face detected in {video}")
+            raise RuntimeError(
+                "no face was detected in the clip. Please use a frontal "
+                "talking-face video with the whole face visible."
+            )
         # Head-size normalization: scale the mouth crop to the detected face
         # size (via IOD) so the mouth-to-head ratio matches GRID regardless of
         # how big the face is in the frame. On GRID this yields ~64px (no-op).
@@ -745,16 +749,40 @@ def launch_ui(reader: LipReader, example_paths=None,
     import gradio as gr
 
     def infer(video, consent, source, request: gr.Request):
+        # Last two slots: Submit interactivity and the input video itself
+        # (cleared when the clip was the problem, kept otherwise).
+        blank = ("", None, None, None, "")
         if not video:
-            return "", None, None, None, ""
+            return (*blank, gr.update(interactive=False), gr.update())
         ip = request.client.host if request and request.client else "unknown"
         limit = webcam_limit if source == "webcam" else upload_limit
         if _quota_exceeded(ip, source, limit):
             kind = "webcam recordings" if source == "webcam" else "file uploads"
-            raise gr.Error(
+            gr.Warning(
                 f"Daily limit reached ({limit} {kind} per visitor). "
                 "Please try again tomorrow."
             )
+            # Nothing wrong with the clip; keep it loaded.
+            return (*blank, gr.update(interactive=False), gr.update())
+        try:
+            return _infer(video, consent, source)
+        except gr.Error as e:
+            # Surface the explanation as a toast WITHOUT raising: raising
+            # stamps a red "Error" badge on every output component. The
+            # faulty clip is cleared, returning the upload area to its
+            # normal empty state (the change handler then resets Submit).
+            gr.Warning(e.message)
+            return (*blank, gr.update(), None)
+        except Exception:
+            # Never let a bare, unexplained "Error" toast reach the user.
+            logging.exception(f"Unexpected failure processing {video}")
+            gr.Warning(
+                "Processing failed unexpectedly; the problem has been "
+                "logged. Please try again with a different clip."
+            )
+            return (*blank, gr.update(), None)
+
+    def _infer(video, consent, source):
         try:
             text, roi, word_confs = reader.recognize(video)
         except Exception as e:
@@ -792,6 +820,10 @@ def launch_ui(reader: LipReader, example_paths=None,
             _frames_to_mp4(roi, out_dir=out_dir),
             roi_strip(roi),
             saved_id,
+            # This clip is done; Submit stays off until a new one arrives
+            # (re-enabled by video_in.change below). The clip stays loaded.
+            gr.update(interactive=False),
+            gr.update(),
         )
 
     # Example clips: GRID .mpg won't play in the browser, so show a transcoded
@@ -814,6 +846,13 @@ def launch_ui(reader: LipReader, example_paths=None,
     /* Letterbox the live webcam preview instead of crop-zooming it to fill
        the container, which distorts/flattens the view. */
     video { object-fit: contain !important; }
+    /* Never break a word-confidence chip across lines; wrap whole chips. */
+    .word-conf span { display: inline-block; white-space: nowrap; }
+    .rec-text textarea { font-weight: bold; }
+    /* Hide the gradio footer (Built with Gradio / Use via API / Settings). */
+    footer { display: none !important; }
+    /* Hide the video trim (scissors) control on the input player. */
+    button[aria-label="Trim video to selection"] { display: none !important; }
     """
     # delete_cache purges gradio's upload/output cache (every hour, files
     # older than an hour) -- gradio never cleans it on its own.
@@ -841,7 +880,10 @@ def launch_ui(reader: LipReader, example_paths=None,
                               "training: s1, s2, s20, s22 "
                               "(click, then Submit)",
                     )
-                submit = gr.Button("Submit", variant="primary")
+                # Enabled only while an unsubmitted clip is loaded: off at
+                # start, on when the input changes, off again after infer.
+                submit = gr.Button("Submit", variant="primary",
+                                   interactive=False)
                 save_cb = gr.Checkbox(
                     label="I consent to the cropped mouth-region frames and "
                           "the clip's audio track being saved on the server "
@@ -863,16 +905,18 @@ def launch_ui(reader: LipReader, example_paths=None,
                 with gr.Row():
                     roi_vid = gr.Video(
                         label="Mouth ROI (animated)",
-                        show_download_button=False, height=290,
+                        show_download_button=False, height=240, scale=1,
                     )
-                    with gr.Column():
-                        text_out = gr.Textbox(label="Recognised text")
+                    with gr.Column(scale=2):
+                        text_out = gr.Textbox(label="Recognised text",
+                                              elem_classes=["rec-text"])
                         conf_out = gr.HighlightedText(
                             label="Word confidence",
                             color_map={"high": "green", "medium": "yellow",
                                        "low": "red"},
                             show_inline_category=False,
                             show_legend=False,
+                            elem_classes=["word-conf"],
                         )
                 strip_out = gr.Image(
                     label="Mouth ROI (sampled frames)", image_mode="L",
@@ -892,7 +936,13 @@ def launch_ui(reader: LipReader, example_paths=None,
             Submit: warn and clear the input. recognize() re-checks as a
             backstop for the CLI/API path."""
             if video:
-                err = _duration_error(video)
+                try:
+                    err = _duration_error(video)
+                except Exception:
+                    logging.exception(f"Could not read uploaded clip {video}")
+                    gr.Warning("This video file could not be read; please "
+                               "try a different file or format.")
+                    return None, "upload"
                 if err:
                     gr.Warning(err)
                     return None, "upload"
@@ -902,17 +952,36 @@ def launch_ui(reader: LipReader, example_paths=None,
             check_length, inputs=[video_in], outputs=[video_in, source_state]
         )
         video_in.stop_recording(lambda: "webcam", outputs=[source_state])
+        # Fires on any new value (upload, webcam recording, example click)
+        # and on clearing: Submit is usable exactly when a clip is loaded,
+        # and results from the previous clip are cleared.
+        def on_clip_change(video):
+            return (
+                gr.update(interactive=video is not None),
+                "",    # recognised text
+                None,  # word confidence
+                None,  # ROI video
+                None,  # ROI strip
+                "",    # saved data ID
+            )
+
+        video_in.change(
+            on_clip_change, inputs=[video_in],
+            outputs=[submit, text_out, conf_out, roi_vid, strip_out,
+                     saved_out],
+        )
         submit.click(
             infer,
             inputs=[video_in, save_cb, source_state],
-            outputs=[text_out, conf_out, roi_vid, strip_out, saved_out],
+            outputs=[text_out, conf_out, roi_vid, strip_out, saved_out,
+                     submit, video_in],
         )
     # One GPU inference at a time with a bounded waiting line (visitors see
     # their queue position); protects the server when the demo is public.
     demo.queue(default_concurrency_limit=1, max_size=10)
     # Abort oversized transfers during upload; 100 MB covers any legitimate
     # clip within the accepted duration (a 15 s 4K phone video is ~100-200 MB).
-    demo.launch(max_file_size="100mb")
+    demo.launch(max_file_size="100mb", show_api=False)
 
 
 def get_args() -> argparse.Namespace:
