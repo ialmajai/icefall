@@ -720,8 +720,28 @@ def _save_roi_data(roi: np.ndarray, video: str, save_dir: Path) -> str:
     return stem
 
 
+def _log_usage(save_dir: Path, source: str, duration: float, text: str,
+               saved_id: str) -> None:
+    """Append one line per completed recognition to save_dir/usage.log:
+    timestamp, source (upload/webcam), clip duration, saved-data ID ('-' if
+    nothing was saved), recognized text. Deliberately contains no visitor
+    identifiers (no IPs)."""
+    from datetime import datetime
+
+    save_dir.mkdir(parents=True, exist_ok=True)
+    line = "\t".join([
+        datetime.now().isoformat(timespec="seconds"),
+        source,
+        f"{duration:.1f}s",
+        saved_id or "-",
+        text,
+    ])
+    with open(save_dir / "usage.log", "a", encoding="utf-8") as f:
+        f.write(line + "\n")
+
+
 def launch_ui(reader: LipReader, example_paths=None,
-              upload_limit=5, webcam_limit=20):
+              upload_limit=2, webcam_limit=5):
     import gradio as gr
 
     def infer(video, consent, source, request: gr.Request):
@@ -753,6 +773,11 @@ def launch_ui(reader: LipReader, example_paths=None,
                 except Exception:
                     logging.exception("Saving consented data failed")
                     gr.Warning("Saving your data failed; nothing was stored.")
+        try:
+            _log_usage(reader.save_dir, source, _video_duration(video),
+                       text, saved_id)
+        except OSError:
+            logging.exception("Writing usage.log failed")  # non-fatal
         out_dir = _new_request_dir()
         return (
             text,
@@ -786,6 +811,9 @@ def launch_ui(reader: LipReader, example_paths=None,
     css = """
     .source-selection { height: var(--size-12) !important; flex-shrink: 0; }
     .source-selection .icon { width: 30px !important; height: 30px !important; }
+    /* Letterbox the live webcam preview instead of crop-zooming it to fill
+       the container, which distorts/flattens the view. */
+    video { object-fit: contain !important; }
     """
     # delete_cache purges gradio's upload/output cache (every hour, files
     # older than an hour) -- gradio never cleans it on its own.
@@ -796,14 +824,12 @@ def launch_ui(reader: LipReader, example_paths=None,
         gr.Markdown(
             "AV-HuBERT visual features → Conformer-CTC. "
             "Upload or record a frontal talking-face video "
-            f"({MIN_DURATION_S:g}–{MAX_DURATION_S:g} s). "
-            f"Daily limit per visitor: {upload_limit} file uploads, "
-            f"{webcam_limit} webcam recordings."
+            f"({MIN_DURATION_S:g}–{MAX_DURATION_S:g} s)."
         )
         with gr.Row():
             with gr.Column():
                 video_in = gr.Video(
-                    label="Frontal talking-face clip", height=290
+                    label="Frontal talking-face clip", height=410
                 )
                 # Where the current clip came from ("upload"/"webcam"), for
                 # the per-source quota; set by the upload/record events below.
@@ -929,10 +955,10 @@ def get_args() -> argparse.Namespace:
     p.add_argument("--num-decoder-layers", type=int, default=3)
     p.add_argument("--ui", action="store_true",
                    help="Launch the Gradio web UI instead of CLI.")
-    p.add_argument("--max-uploads-per-day", type=int, default=5,
+    p.add_argument("--max-uploads-per-day", type=int, default=2,
                    help="UI quota: file-upload submissions allowed per "
                         "visitor (IP) per day.")
-    p.add_argument("--max-webcam-per-day", type=int, default=20,
+    p.add_argument("--max-webcam-per-day", type=int, default=5,
                    help="UI quota: webcam-recording submissions allowed per "
                         "visitor (IP) per day.")
     p.add_argument("--examples", type=Path, nargs="*",
