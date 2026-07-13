@@ -138,6 +138,11 @@ ground-truth supervision and alignment for the visual data. The full video is
 never stored; uploaded clips are processed in temporary files that are
 routinely deleted. Be aware that a voice recording may identify you.
 
+**Your own videos only**: consent is valid only for videos of yourself that
+you recorded. Do not tick the consent box for clips of other people or for
+clips taken from existing datasets; you cannot consent on their behalf. The
+bundled example clips are never saved.
+
 **Record alone**: please record by yourself in a quiet room, because the
 microphone also captures other people's voices, and they cannot consent
 through this form.
@@ -593,6 +598,18 @@ _REQUEST_DIRS: list = []
 _MAX_REQUEST_DIRS = 4
 
 
+def _file_sig(path: str) -> str:
+    """MD5 of a file's content, used to recognize the bundled example clips
+    even after gradio copies them into its cache under a new path."""
+    import hashlib
+
+    h = hashlib.md5()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
 def _new_request_dir() -> str:
     import shutil
     import tempfile
@@ -709,7 +726,7 @@ def launch_ui(reader: LipReader, example_paths=None,
 
     def infer(video, consent, source, request: gr.Request):
         if not video:
-            return None, "", None, None, None, ""
+            return "", None, None, None, ""
         ip = request.client.host if request and request.client else "unknown"
         limit = webcam_limit if source == "webcam" else upload_limit
         if _quota_exceeded(ip, source, limit):
@@ -725,14 +742,19 @@ def launch_ui(reader: LipReader, example_paths=None,
             raise gr.Error(f"Recognition failed: {e}")
         saved_id = ""
         if consent:
-            try:
-                saved_id = _save_roi_data(roi, video, reader.save_dir)
-            except Exception:
-                logging.exception("Saving consented data failed")
-                gr.Warning("Saving your data failed; nothing was stored.")
+            # Bundled examples are corpus data, not the visitor's to donate:
+            # consent cannot be given on their behalf, so never save them.
+            if _file_sig(video) in example_sigs:
+                gr.Info("Example clips are never saved: they are corpus "
+                        "data, not yours to donate.")
+            else:
+                try:
+                    saved_id = _save_roi_data(roi, video, reader.save_dir)
+                except Exception:
+                    logging.exception("Saving consented data failed")
+                    gr.Warning("Saving your data failed; nothing was stored.")
         out_dir = _new_request_dir()
         return (
-            _to_playable_mp4(video, out_dir),
             text,
             # Score in the text (gradio only tints, never prints, labels) plus
             # a bucket category for the colour: float labels tint red like a
@@ -750,11 +772,14 @@ def launch_ui(reader: LipReader, example_paths=None,
     # Example clips: GRID .mpg won't play in the browser, so show a transcoded
     # mp4 copy (kept for the server's lifetime) when ffmpeg is available.
     examples = []
+    example_sigs = set()  # content hashes of the bundled clips (see infer)
     for pth in example_paths or []:
         if not Path(pth).exists():
             logging.warning(f"Example clip not found, skipping: {pth}")
             continue
-        examples.append([_to_playable_mp4(str(pth)) or str(pth)])
+        prepared = _to_playable_mp4(str(pth)) or str(pth)
+        examples.append([prepared])
+        example_sigs.update({_file_sig(str(pth)), _file_sig(prepared)})
 
     # Only the input component has a .source-selection bar (upload/webcam
     # icons); keep it un-clipped and its icons comfortably visible.
@@ -786,7 +811,9 @@ def launch_ui(reader: LipReader, example_paths=None,
                 if examples:
                     gr.Examples(
                         examples=examples, inputs=[video_in],
-                        label="Example clips (click, then Submit)",
+                        label="Example clips from speakers unseen in "
+                              "training: s1, s2, s20, s22 "
+                              "(click, then Submit)",
                     )
                 submit = gr.Button("Submit", variant="primary")
                 save_cb = gr.Checkbox(
@@ -794,7 +821,10 @@ def launch_ui(reader: LipReader, example_paths=None,
                           "the clip's audio track being saved on the server "
                           "for lipreading and audio-visual speech research. "
                           "The full video is not stored; note that a voice "
-                          "recording may be identifying.",
+                          "recording may be identifying. Tick this only for "
+                          "videos of yourself that you recorded: you cannot "
+                          "consent on behalf of other people or for clips "
+                          "taken from datasets.",
                     value=False,
                 )
                 saved_out = gr.Textbox(
@@ -803,30 +833,32 @@ def launch_ui(reader: LipReader, example_paths=None,
                 )
                 with gr.Accordion("Privacy notice", open=False):
                     gr.Markdown(PRIVACY_NOTICE_MD)
-                with gr.Accordion("Valid GRID sentence structure", open=False):
-                    gr.HTML(_grammar_fst_svg())
-                    gr.Markdown(GRID_GRAMMAR_MD)
             with gr.Column():
                 with gr.Row():
-                    playback = gr.Video(
-                        label="Playback (transcoded to mp4)", height=240,
-                        show_download_button=False,
-                    )
                     roi_vid = gr.Video(
                         label="Mouth ROI (animated)",
-                        show_download_button=False, height=240,
+                        show_download_button=False, height=290,
                     )
-                text_out = gr.Textbox(label="Recognised text")
-                conf_out = gr.HighlightedText(
-                    label="Word confidence",
-                    color_map={"high": "green", "medium": "yellow", "low": "red"},
-                    show_inline_category=False,
-                    show_legend=False,
-                )
+                    with gr.Column():
+                        text_out = gr.Textbox(label="Recognised text")
+                        conf_out = gr.HighlightedText(
+                            label="Word confidence",
+                            color_map={"high": "green", "medium": "yellow",
+                                       "low": "red"},
+                            show_inline_category=False,
+                            show_legend=False,
+                        )
                 strip_out = gr.Image(
                     label="Mouth ROI (sampled frames)", image_mode="L",
                     height=140, show_download_button=False,
                 )
+                # Grammar: the FST drawing is always visible, filling the
+                # space beside the consent area; word tables sit behind the
+                # accordion.
+                gr.Markdown("### Valid GRID sentence structure")
+                gr.HTML(_grammar_fst_svg())
+                with gr.Accordion("Full grammar description", open=False):
+                    gr.Markdown(GRID_GRAMMAR_MD)
         gr.Markdown(ACKNOWLEDGEMENTS_MD)
 
         def check_length(video):
@@ -847,8 +879,7 @@ def launch_ui(reader: LipReader, example_paths=None,
         submit.click(
             infer,
             inputs=[video_in, save_cb, source_state],
-            outputs=[playback, text_out, conf_out, roi_vid, strip_out,
-                     saved_out],
+            outputs=[text_out, conf_out, roi_vid, strip_out, saved_out],
         )
     # One GPU inference at a time with a bounded waiting line (visitors see
     # their queue position); protects the server when the demo is public.
@@ -906,7 +937,9 @@ def get_args() -> argparse.Namespace:
                         "visitor (IP) per day.")
     p.add_argument("--examples", type=Path, nargs="*",
                    default=[Path("grid-corpus/s1/bbaf2n.mpg"),
-                            Path("s7_l_lwwm7p.mov")],
+                            Path("grid-corpus/s2/sgbp4s.mpg"),
+                            Path("grid-corpus/s20/pgwj3p.mpg"),
+                            Path("grid-corpus/s22/srwaza.mpg")],
                    help="Example clips offered in the UI (missing files are "
                         "skipped). Pass no paths to disable.")
     p.add_argument("video", nargs="?", default=None,
