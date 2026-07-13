@@ -77,6 +77,10 @@ MOUTH_LEFT, MOUTH_RIGHT = 48, 54  # dlib 68-point landmark indices
 MOUTH_W = MOUTH_H = 64
 BLANK_ID = 0  # icefall CTC blank
 TARGET_FPS = 25.0  # GRID / AV-HuBERT frame rate; other rates are resampled
+# Frames taller than this are downscaled for face *detection* only (dlib's
+# HOG scan is ~linear in pixels; phone videos are 1080p+). Landmarks and the
+# mouth crop still use full resolution.
+DETECT_HEIGHT = 480
 # Accepted clip length. Below the minimum no GRID-style sentence fits; above
 # the maximum, per-frame landmarking would tie up the demo for too long.
 # The tolerance keeps nominal-length clips from being rejected over container
@@ -180,6 +184,68 @@ ACKNOWLEDGEMENTS_MD = """
 [icefall](https://github.com/k2-fsa/icefall) / k2 and
 [dlib](http://dlib.net/) facial landmarks.
 """
+
+def _grammar_fst_svg() -> str:
+    """The GRID grammar drawn as a linear ("sausage") FST: 7 states in a row,
+    one bundle of parallel word arcs per slot. Inline SVG that scales to the
+    container width and uses currentColor, so it follows the UI theme. The
+    25-letter and 10-digit slots are elided with a dashed '...' arc; the full
+    inventories are in the table below the drawing."""
+    slots = [
+        ("command", ["bin", "lay", "place", "set"]),
+        ("colour", ["blue", "green", "red", "white"]),
+        ("preposition", ["at", "by", "in", "with"]),
+        ("letter (a–z, no w)", ["a", "b", "…", "z"]),
+        ("digit", ["zero", "one", "…", "nine"]),
+        ("adverb", ["again", "now", "please", "soon"]),
+    ]
+    seg_w, x0, y, r = 170, 40, 170, 14
+    apexes = [-84, -28, 28, 84]  # vertical peak of each parallel arc
+    parts = []
+    for i, (title, words) in enumerate(slots):
+        x1, x2 = x0 + i * seg_w, x0 + (i + 1) * seg_w
+        cx = (x1 + x2) // 2
+        parts.append(
+            f'<text x="{cx}" y="28" text-anchor="middle" font-weight="bold" '
+            f'font-size="16" fill="currentColor">{title}</text>'
+        )
+        for a, w in zip(apexes, words):
+            dash = ' stroke-dasharray="4 4"' if w == "…" else ""
+            parts.append(
+                f'<path d="M {x1 + r} {y} Q {cx} {y + 2 * a} {x2 - r} {y}" '
+                f'fill="none" stroke="currentColor" stroke-opacity="0.45" '
+                f'marker-end="url(#arr)"{dash}/>'
+            )
+            ty = y + a + (-8 if a < 0 else 16)
+            parts.append(
+                f'<text x="{cx}" y="{ty}" text-anchor="middle" '
+                f'font-size="15" fill="currentColor">{w}</text>'
+            )
+    for i in range(len(slots) + 1):
+        x = x0 + i * seg_w
+        parts.append(
+            f'<circle cx="{x}" cy="{y}" r="{r}" fill="none" '
+            f'stroke="currentColor" stroke-width="2"/>'
+        )
+        if i == len(slots):  # final state: double circle
+            parts.append(
+                f'<circle cx="{x}" cy="{y}" r="{r - 4}" fill="none" '
+                f'stroke="currentColor" stroke-width="2"/>'
+            )
+        parts.append(
+            f'<text x="{x}" y="{y + 5}" text-anchor="middle" font-size="12" '
+            f'fill="currentColor">{i}</text>'
+        )
+    return (
+        '<svg viewBox="0 0 1100 300" role="img" '
+        'aria-label="GRID grammar as a linear FST" '
+        'style="width:100%;height:auto" xmlns="http://www.w3.org/2000/svg">'
+        '<defs><marker id="arr" viewBox="0 0 10 10" refX="9" refY="5" '
+        'markerWidth="7" markerHeight="7" orient="auto">'
+        '<path d="M 0 0 L 10 5 L 0 10 z" fill="#888"/></marker></defs>'
+        + "".join(parts) + "</svg>"
+    )
+
 
 # HLG lattice-decoding hyper-parameters (from decode.py get_params()).
 SEARCH_BEAM = 20
@@ -330,7 +396,10 @@ class LipReader:
     def _roi_and_features_25fps(self, video: str, video_path: Path):
         """`_roi_and_features` body; video_path is the (possibly resampled)
         clip to process, video the original name for messages."""
-        landmarks = _detect_landmarks(video_path, self.detector, self.predictor, 1)
+        landmarks = _detect_landmarks(
+            video_path, self.detector, self.predictor, 1,
+            detect_height=DETECT_HEIGHT,
+        )
         if landmarks is None:
             raise RuntimeError(f"No face detected in {video}")
         # Head-size normalization: scale the mouth crop to the detected face
@@ -735,6 +804,7 @@ def launch_ui(reader: LipReader, example_paths=None,
                 with gr.Accordion("Privacy notice", open=False):
                     gr.Markdown(PRIVACY_NOTICE_MD)
                 with gr.Accordion("Valid GRID sentence structure", open=False):
+                    gr.HTML(_grammar_fst_svg())
                     gr.Markdown(GRID_GRAMMAR_MD)
             with gr.Column():
                 with gr.Row():

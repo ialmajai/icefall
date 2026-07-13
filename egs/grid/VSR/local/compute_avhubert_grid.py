@@ -274,9 +274,14 @@ def _open_video(path: Path) -> cv2.VideoCapture:
     return cap
 
 
-def _detect_landmarks(video_path: Path, dlib_detector,  dlib_predictor, detect_every: int) -> np.ndarray | None:
+def _detect_landmarks(video_path: Path, dlib_detector,  dlib_predictor, detect_every: int, detect_height: int | None = None) -> np.ndarray | None:
     """
     Run dlib face + landmark detection on every ``detect_every``-th frame.
+
+    If ``detect_height`` is set and frames are taller, the (slow, ~linear in
+    pixels) face *detection* runs on a copy downscaled to that height, while
+    the landmark predictor still runs at full resolution for precision.
+    Landmarks are always in original-frame coordinates.
 
     Returns an ``(T, 68, 2)`` int array, or ``None`` if no face was detected
     on the first keyed frame.
@@ -293,11 +298,24 @@ def _detect_landmarks(video_path: Path, dlib_detector,  dlib_predictor, detect_e
             gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
 
             if frame_idx % detect_every == 0:
-                faces = dlib_detector(gray)
+                scale = 1.0
+                small = gray
+                if detect_height and gray.shape[0] > detect_height:
+                    scale = detect_height / gray.shape[0]
+                    small = cv2.resize(
+                        gray, (round(gray.shape[1] * scale), detect_height)
+                    )
+                faces = dlib_detector(small)
                 if not faces:
                     logging.warning(f"No face detected in {video_path} at frame {frame_idx}.")
                     return None
-                shape = dlib_predictor(gray, faces[0])
+                face = faces[0]
+                if scale != 1.0:
+                    face = dlib.rectangle(
+                        round(face.left() / scale), round(face.top() / scale),
+                        round(face.right() / scale), round(face.bottom() / scale),
+                    )
+                shape = dlib_predictor(gray, face)
                 last_lm = np.array([[p.x, p.y] for p in shape.parts()])
 
             landmarks.append(last_lm)
