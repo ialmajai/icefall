@@ -175,12 +175,34 @@ to your data protection authority.
 This demo is intended for adults (18+).
 """
 
-# Per-visitor (IP) daily usage quotas for the UI. Kept in memory only, so a
-# server restart clears the counters. IP-based counting is a courtesy limit
-# for volunteers, not a security boundary (shared NATs pool their quota).
-QUOTA_WINDOW_S = 24 * 3600
+# Per-visitor (IP) usage quotas for the UI, hourly and daily, counted over
+# all submissions regardless of source (upload or webcam). Kept in memory
+# only, so a server restart clears the counters. IP-based counting is a
+# courtesy limit for volunteers, not a security boundary (shared NATs pool
+# their quota).
+QUOTA_HOUR_S = 3600
+QUOTA_DAY_S = 24 * 3600
 
-_usage_log = {}  # (ip, source) -> submission timestamps within the window
+_usage_log = {}  # ip -> submission timestamps within the last day
+
+# Duplicate guard: an identical video (by content hash) resubmitted by the
+# same visitor with identical noise/blur settings within this window is not
+# reprocessed; results would be the same. Local (operator) IPs are exempt.
+SEEN_WINDOW_S = 3600
+
+_seen_log = {}  # (ip, sig, noise, blur) -> time last processed
+
+
+def _seen_recently(ip: str, sig: str, noise: float, blur: float) -> bool:
+    now = time.time()
+    for k, t in list(_seen_log.items()):  # opportunistic pruning
+        if now - t >= SEEN_WINDOW_S:
+            del _seen_log[k]
+    return (ip, sig, noise, blur) in _seen_log
+
+
+def _mark_seen(ip: str, sig: str, noise: float, blur: float) -> None:
+    _seen_log[(ip, sig, noise, blur)] = time.time()
 
 
 def _client_ip(request) -> str:
@@ -211,17 +233,20 @@ def _is_local_ip(ip: str) -> bool:
     return addr.is_loopback or addr.is_private
 
 
-def _quota_exceeded(ip: str, source: str, limit: int) -> bool:
-    """Record one use and report whether the (ip, source) daily limit is hit."""
+def _quota_exceeded(ip: str, hour_limit: int, day_limit: int):
+    """Record one use unless a limit is hit. Returns None when allowed,
+    otherwise the name of the exceeded window ('hourly' or 'daily')."""
     now = time.time()
-    key = (ip, source)
-    recent = [t for t in _usage_log.get(key, []) if now - t < QUOTA_WINDOW_S]
-    if len(recent) >= limit:
-        _usage_log[key] = recent
-        return True
+    recent = [t for t in _usage_log.get(ip, []) if now - t < QUOTA_DAY_S]
+    if len(recent) >= day_limit:
+        _usage_log[ip] = recent
+        return "daily"
+    if sum(1 for t in recent if now - t < QUOTA_HOUR_S) >= hour_limit:
+        _usage_log[ip] = recent
+        return "hourly"
     recent.append(now)
-    _usage_log[key] = recent
-    return False
+    _usage_log[ip] = recent
+    return None
 
 
 # Attribution shown in the UI footer (GRID is CC BY 4.0 -> attribution due).
@@ -852,7 +877,7 @@ def _log_usage(save_dir: Path, source: str, duration: float, text: str,
 
 
 def launch_ui(reader: LipReader, example_paths=None,
-              upload_limit=2, webcam_limit=5):
+              hour_limit=5, day_limit=15):
     import gradio as gr
 
     def infer(video, consent, source, noise, blur, request: gr.Request):
@@ -862,17 +887,34 @@ def launch_ui(reader: LipReader, example_paths=None,
         if not video:
             return (*blank, gr.update(interactive=False), gr.update())
         ip = _client_ip(request)
-        limit = webcam_limit if source == "webcam" else upload_limit
-        if not _is_local_ip(ip) and _quota_exceeded(ip, source, limit):
-            kind = "webcam recordings" if source == "webcam" else "file uploads"
+        local = _is_local_ip(ip)
+        sig = _file_sig(video)
+        if not local and _seen_recently(ip, sig, noise, blur):
             gr.Warning(
-                f"Daily limit reached ({limit} {kind} per visitor). "
-                "Please try again tomorrow."
+                "This video has already been processed in the last hour "
+                "with the same settings, so the result would be identical. "
+                "Change the noise/blur sliders or submit a different clip."
+            )
+            return (*blank, gr.update(interactive=False), gr.update())
+        window = None if local else _quota_exceeded(ip, hour_limit, day_limit)
+        if window == "hourly":
+            gr.Warning(
+                f"Hourly limit reached ({hour_limit} videos per visitor "
+                "per hour). Please try again in a little while."
             )
             # Nothing wrong with the clip; keep it loaded.
             return (*blank, gr.update(interactive=False), gr.update())
+        if window == "daily":
+            gr.Warning(
+                f"Daily limit reached ({day_limit} videos per visitor "
+                "per day). Please try again tomorrow."
+            )
+            return (*blank, gr.update(interactive=False), gr.update())
         try:
-            return _infer(video, consent, source, noise, blur)
+            result = _infer(video, consent, source, noise, blur, sig)
+            if not local:
+                _mark_seen(ip, sig, noise, blur)
+            return result
         except gr.Error as e:
             # Surface the explanation as a toast WITHOUT raising: raising
             # stamps a red "Error" badge on every output component. The
@@ -889,7 +931,7 @@ def launch_ui(reader: LipReader, example_paths=None,
             )
             return (*blank, gr.update(), None)
 
-    def _infer(video, consent, source, noise=0.0, blur=0.0):
+    def _infer(video, consent, source, noise=0.0, blur=0.0, sig=None):
         degraded = bool(noise or blur)
         try:
             text, roi, word_confs = reader.recognize(video, noise, blur)
@@ -900,7 +942,7 @@ def launch_ui(reader: LipReader, example_paths=None,
         if consent:
             # Bundled examples are corpus data, not the visitor's to donate:
             # consent cannot be given on their behalf, so never save them.
-            if _file_sig(video) in example_sigs:
+            if (sig or _file_sig(video)) in example_sigs:
                 gr.Info("Example clips are never saved: they are corpus "
                         "data, not yours to donate.")
             elif degraded:
@@ -979,6 +1021,31 @@ def launch_ui(reader: LipReader, example_paths=None,
     # matching CSS above hides the transient "Error" pill.
     js = """
     () => {
+      // Animated prompt under the upload box: cycle randomly generated
+      // grammar-valid sentences so users know what to say before recording.
+      const cmd = ['bin','lay','place','set'],
+            col = ['blue','green','red','white'],
+            prep = ['at','by','in','with'],
+            letters = 'abcdefghijklmnopqrstuvxyz'.split(''),
+            dig = ['zero','one','two','three','four','five','six','seven',
+                   'eight','nine'],
+            adv = ['again','now','please','soon'];
+      const pick = a => a[Math.floor(Math.random() * a.length)];
+      const ticker = document.getElementById('sentence-ticker');
+      if (ticker) {
+        ticker.style.transition = 'opacity 0.35s';
+        const tick = () => {
+          ticker.style.opacity = 0;
+          setTimeout(() => {
+            ticker.textContent = 'Try saying: \\u201C' +
+              [pick(cmd), pick(col), pick(prep), pick(letters), pick(dig),
+               pick(adv)].join(' ') + '\\u201D';
+            ticker.style.opacity = 1;
+          }, 350);
+        };
+        tick();
+        setInterval(tick, 3000);
+      }
       const resetErrored = () => {
         document.querySelectorAll('.block .error').forEach(err => {
           const block = err.closest('.block');
@@ -995,17 +1062,27 @@ def launch_ui(reader: LipReader, example_paths=None,
         .observe(document.body, {subtree: true, childList: true});
     }
     """
-    # delete_cache purges gradio's upload/output cache (every hour, files
-    # older than an hour) -- gradio never cleans it on its own.
+    # delete_cache purges gradio's upload/output cache (every 10 minutes,
+    # files older than 15) -- gradio never cleans it on its own, and the
+    # cache lives on a bounded tmpfs that upload bursts could otherwise fill.
     with gr.Blocks(
-        title="Can AI Read Your Lips? A Live Lipreading Demo",
-        delete_cache=(3600, 3600), css=css, js=js,
+        title="Can AI Read Your Lips? A Live Lipreading Demo "
+              "(based on GRID corpus)",
+        delete_cache=(600, 900), css=css, js=js,
     ) as demo:
-        gr.Markdown("# Can AI Read Your Lips? A Live Lipreading Demo")
+        gr.Markdown("# Can AI Read Your Lips? A Live Lipreading Demo "
+                    "(based on GRID corpus)")
         with gr.Row():
             with gr.Column():
                 video_in = gr.Video(
                     label="Frontal talking-face clip", height=410
+                )
+                # Rotating grammar-valid sentence prompt (animated by js),
+                # so users know what to say before recording.
+                gr.HTML(
+                    '<div id="sentence-ticker" style="text-align:center;'
+                    'font-size:1.1em;font-weight:600;padding:6px 0;'
+                    'min-height:1.4em;color:var(--color-accent)"></div>'
                 )
                 # Where the current clip came from ("upload"/"webcam"), for
                 # the per-source quota; set by the upload/record events below.
@@ -1017,39 +1094,57 @@ def launch_ui(reader: LipReader, example_paths=None,
                               "training: s1, s2, s20, s22 & one from "
                               "Lombard Grid corpus (click, then Submit)",
                     )
-                with gr.Accordion("Robustness playground (optional)",
-                                  open=False):
+                with gr.Accordion(
+                    "Challenge the model: add noise or blur (optional)",
+                    open=False,
+                ):
                     gr.Markdown(
-                        "Degrade the mouth crop before recognition to see "
-                        "how performance holds up (the ROI panels show what "
-                        "the model received). Applied after face tracking; "
-                        "0 = off. Degraded runs are never saved."
+                        "These sliders worsen the video quality of the "
+                        "mouth region before the model reads it, so you can "
+                        "see how much degradation it tolerates. The Mouth "
+                        "ROI panels show exactly what the model received. "
+                        "Leave at 0 for normal recognition. Degraded clips "
+                        "are never saved."
                     )
                     noise_sl = gr.Slider(0, 50, value=0, step=1,
-                                         label="Gaussian noise (σ)")
+                                         label="Noise (0 = none)")
                     blur_sl = gr.Slider(0, 5, value=0, step=0.25,
-                                        label="Gaussian blur (σ, pixels)")
+                                        label="Blur (0 = none)")
                 # Enabled only while an unsubmitted clip is loaded: off at
                 # start, on when the input changes, off again after infer.
                 submit = gr.Button("Submit", variant="primary",
                                    interactive=False)
-                save_cb = gr.Checkbox(
-                    label="I consent to the cropped mouth-region frames and "
-                          "the clip's audio track being saved on the server "
-                          "for lipreading and audio-visual speech research. "
-                          "The full video is not stored; note that a voice "
-                          "recording may be identifying. Tick this only for "
-                          "videos of yourself that you recorded: you cannot "
-                          "consent on behalf of other people or for clips "
-                          "taken from datasets.",
-                    value=False,
+                gr.Markdown(
+                    "*Your video is processed and discarded; nothing is "
+                    "stored unless you opt in below.*"
                 )
-                saved_out = gr.Textbox(
-                    label="Saved data ID (quote this to request deletion)",
-                    interactive=False,
-                )
-                with gr.Accordion("Privacy notice", open=False):
-                    gr.Markdown(PRIVACY_NOTICE_MD)
+                # Consent flow lives behind this accordion so the default
+                # path shows no data-retention language at all; the few who
+                # want to contribute self-select into it.
+                with gr.Accordion(
+                    "Want to help the research? Donate your clip (optional)",
+                    open=False,
+                ):
+                    save_cb = gr.Checkbox(
+                        label="Tick this box if you consent to the cropped "
+                              "mouth-region frames and the clip's audio "
+                              "track being saved on the server for "
+                              "lipreading and audio-visual speech research. "
+                              "The full video is not stored; note that a "
+                              "voice recording may be identifying. Consent "
+                              "only applies to videos of yourself that you "
+                              "recorded: you cannot consent on behalf of "
+                              "other people or for clips taken from "
+                              "datasets.",
+                        value=False,
+                    )
+                    saved_out = gr.Textbox(
+                        label="Saved data ID (quote this to request "
+                              "deletion)",
+                        interactive=False,
+                    )
+                    with gr.Accordion("Privacy notice", open=False):
+                        gr.Markdown(PRIVACY_NOTICE_MD)
             with gr.Column():
                 with gr.Row():
                     roi_vid = gr.Video(
@@ -1074,7 +1169,13 @@ def launch_ui(reader: LipReader, example_paths=None,
                 # Grammar: the FST drawing is always visible, filling the
                 # space beside the consent area; word tables sit behind the
                 # accordion.
-                gr.Markdown("### Valid GRID sentence structure")
+                gr.Markdown(
+                    "### Valid GRID sentence structure\n"
+                    "The model only understands 6-word sentences that follow "
+                    "the pattern below, one word from each column, e.g. "
+                    "**“place green with h eight now”** or "
+                    "**“bin blue at f two now”**."
+                )
                 gr.HTML(_grammar_fst_svg())
                 with gr.Accordion("Full grammar description", open=False):
                     gr.Markdown(GRID_GRAMMAR_MD)
@@ -1180,12 +1281,12 @@ def get_args() -> argparse.Namespace:
     p.add_argument("--num-decoder-layers", type=int, default=3)
     p.add_argument("--ui", action="store_true",
                    help="Launch the Gradio web UI instead of CLI.")
-    p.add_argument("--max-uploads-per-day", type=int, default=2,
-                   help="UI quota: file-upload submissions allowed per "
-                        "visitor (IP) per day.")
-    p.add_argument("--max-webcam-per-day", type=int, default=5,
-                   help="UI quota: webcam-recording submissions allowed per "
-                        "visitor (IP) per day.")
+    p.add_argument("--max-per-hour", type=int, default=5,
+                   help="UI quota: videos (uploaded or recorded) allowed "
+                        "per visitor (IP) per hour.")
+    p.add_argument("--max-per-day", type=int, default=15,
+                   help="UI quota: videos (uploaded or recorded) allowed "
+                        "per visitor (IP) per day.")
     p.add_argument("--examples", type=Path, nargs="*",
                    default=[Path("grid-corpus/s1/bbaf2n.mpg"),
                             Path("grid-corpus/s2/sgbp4s.mpg"),
@@ -1209,7 +1310,7 @@ def main():
 
     if args.ui:
         launch_ui(reader, args.examples,
-                  args.max_uploads_per_day, args.max_webcam_per_day)
+                  args.max_per_hour, args.max_per_day)
     else:
         if args.video is None:
             raise SystemExit("Provide a video path, or pass --ui for the web UI.")

@@ -25,9 +25,10 @@ docker run -d --restart unless-stopped --name vsr-demo \
     --network vsr-net \
     --gpus all \
     --user "$(id -u):$(id -g)" \
-    --read-only --tmpfs /tmp:size=2g \
+    --read-only --tmpfs /tmp:size=4g \
     --cap-drop ALL --security-opt no-new-privileges \
     --memory 16g \
+    -v /etc/localtime:/etc/localtime:ro \
     -v /data/miniconda3/envs/icefall-vsr:/data/miniconda3/envs/icefall-vsr:ro \
     -v /data/icefall:/data/icefall:ro \
     -v "$PWD/demo_saved:/data/icefall/egs/grid/VSR/demo_saved" \
