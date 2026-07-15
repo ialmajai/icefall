@@ -86,7 +86,8 @@ DETECT_HEIGHT = 480
 # The tolerance keeps nominal-length clips from being rejected over container
 # metadata rounding.
 MIN_DURATION_S = 2.0
-MAX_DURATION_S = 15.0
+MAX_DURATION_S = 15.0          # uploaded files
+MAX_DURATION_WEBCAM_S = 20.0  # webcam recordings get a little more headroom
 DURATION_TOL_S = 0.1
 
 # Head-size normalization. GRID has uniform framing: its fixed 64px mouth crop
@@ -140,39 +141,6 @@ Every GRID sentence follows a fixed 6-word grammar:
 | adverb | again, now, please, soon |
 
 Example: **place green with h eight now**
-"""
-
-# Shown in the UI (GDPR Art. 13 information for volunteers).
-PRIVACY_NOTICE_MD = """
-**Who is collecting**: Ibrahim Almajai, independent researcher
-(i.almajai@gmail.com).
-
-**What & why**: If, and only if, you tick the consent box, a single video
-file is saved on the server containing the cropped mouth-region frames
-extracted from your clip and the clip's audio track. It is used for
-lipreading (VSR) and
-audio-visual speech recognition research, where the audio provides
-ground-truth supervision and alignment for the visual data. The full video is
-never stored; uploaded clips are processed in temporary files that are
-routinely deleted. Be aware that a voice recording may identify you.
-
-**Your own videos only**: consent is valid only for videos of yourself that
-you recorded. Do not tick the consent box for clips of other people or for
-clips taken from existing datasets; you cannot consent on their behalf. The
-bundled example clips are never saved.
-
-**Record alone**: please record by yourself in a quiet room, because the
-microphone also captures other people's voices, and they cannot consent
-through this form.
-
-**Retention**: Saved data is deleted at most 12 months after collection.
-
-**Your rights**: You can withdraw consent and have your data deleted at any
-time: email the *Saved data ID* shown after submitting to the address above.
-You may also request a copy of the data, and you have the right to complain
-to your data protection authority.
-
-This demo is intended for adults (18+).
 """
 
 # Per-visitor (IP) usage quotas for the UI, hourly and daily, counted over
@@ -335,6 +303,17 @@ MAX_ACTIVE_STATES = 10000
 # for the decoding lattice) on a held-out unseen-speaker sweep.
 CONF_OUTPUT_BEAM = 10
 CONF_TEMPERATURE = 2.0
+# Out-of-domain detection (1best only): mean non-blank emission log-prob per
+# frame of the best path, i.e. how well the lip frames match the decoded GRID
+# sentence. In-domain GRID speech sits near 0 (~-0.03, worst ~-0.17); non-GRID
+# motion drops well below. Two tiers:
+#   below WARN  -> soft warning, still show the closest-guess result;
+#   below HIDE  -> definitely not a GRID sentence, show nothing (HIDE is well
+#                  below any in-domain score, so an in-domain clip is never
+#                  blanked).
+# TODO: refine both on real non-GRID recordings ([[grid-demo-ood-calibration]]).
+OOD_WARN_THRESHOLD = -0.20
+OOD_HIDE_THRESHOLD = -0.50
 
 
 def load_tokens(path: Path):
@@ -406,12 +385,14 @@ class LipReader:
         g.update(load_globals_dlib(args))  # {detector, predictor}
         self.detector = g["detector"]
         self.predictor = g["predictor"]
+        # Optional slow-but-robust CNN face detector, tried per frame only when
+        # the fast HOG detector fails (glasses, tight framing, mild pose).
+        self.cnn_detector = None
         self.avhubert = g["model"]
         self.transform = g["transform"]
         self.device = g["device"]
         self.layer = args.layer
         self.normalize_head = args.normalize_head
-        self.save_dir = args.save_dir
 
         self.id2sym, num_classes = load_tokens(args.tokens)
 
@@ -485,7 +466,7 @@ class LipReader:
         clip to process, video the original name for messages."""
         landmarks = _detect_landmarks(
             video_path, self.detector, self.predictor, 1,
-            detect_height=DETECT_HEIGHT,
+            detect_height=DETECT_HEIGHT, cnn_detector=self.cnn_detector,
         )
         if landmarks is None:
             logging.warning(f"No face detected in {video}")
@@ -547,7 +528,35 @@ class LipReader:
             word_confs = self._word_confidences_1best(
                 best_path, nnet_output, words
             )
-        return " ".join(words), word_confs
+        try:
+            _, emit_nb = self._emission_score(best_path, nnet_output)
+            ood = ("hide" if emit_nb < OOD_HIDE_THRESHOLD
+                   else "warn" if emit_nb < OOD_WARN_THRESHOLD else "")
+        except Exception:
+            logging.exception("OOD emission score failed")
+            ood = ""
+        return " ".join(words), word_confs, ood
+
+    def _emission_score(self, best_path, nnet_output):
+        """Out-of-domain signal: how well the observed lip frames match the
+        decoded GRID sentence, independent of the grammar. The best path is
+        frame-synchronous, so each arc's token label aligns with a frame;
+        we average the visual model's log-prob of that token over frames.
+        Returns (mean over all frames, mean over non-blank frames only);
+        both are audio-free (nnet_output is the visual model output). Lower
+        (more negative) means the frames are poorly explained -> likely not
+        a GRID utterance."""
+        fsa = best_path[0]
+        labels = [l for l in fsa.labels.tolist() if l != -1]  # token/frame
+        lp = nnet_output[0].cpu()  # (T, C) log-probs
+        T = min(len(labels), lp.shape[0])
+        allf = [lp[t, labels[t]].item() for t in range(T)]
+        nonblank = [lp[t, labels[t]].item()
+                    for t in range(T) if labels[t] != BLANK_ID]
+        mean_all = sum(allf) / len(allf) if allf else float("-inf")
+        mean_nb = (sum(nonblank) / len(nonblank) if nonblank
+                   else float("-inf"))
+        return mean_all, mean_nb
 
     def _build_lattice(self, nnet_output: torch.Tensor, output_beam: int):
         from icefall.decode import get_lattice
@@ -646,21 +655,27 @@ class LipReader:
     @torch.no_grad()
     def recognize(self, video: str, noise_sigma: float = 0.0,
                   blur_sigma: float = 0.0):
-        """Return (recognised_text, ROI frames as recognized, word_confs).
+        """Return (recognised_text, ROI frames as recognized, word_confs, ood).
 
         word_confs is a list of (word, confidence in [0, 1]) pairs; it may be
-        empty when confidences could not be derived."""
-        err = _duration_error(video)
+        empty when confidences could not be derived. ood is '' (in-domain),
+        'warn' (looks out-of-domain, still show the closest guess) or 'hide'
+        (definitely not a GRID sentence); None for greedy decoding, which has
+        no lattice to score."""
+        # Backstop for the CLI/API path (the UI enforces source-specific
+        # limits up front); use the more lenient bound as a pure safety net.
+        err = _duration_error(video, MAX_DURATION_WEBCAM_S)
         if err:
             raise ValueError(err)
         roi, feats = self._roi_and_features(video, noise_sigma, blur_sigma)
         feature = feats.unsqueeze(0).to(self.device)  # (1, T, 768)
         nnet_output = self.model(feature, None)[0]  # (1, T, C)
         if self.method == "1best":
-            text, word_confs = self._decode_1best(nnet_output)
+            text, word_confs, ood = self._decode_1best(nnet_output)
         else:
             text, word_confs = ctc_greedy_decode(nnet_output.cpu(), self.id2sym)
-        return text, roi, word_confs
+            ood = None
+        return text, roi, word_confs, ood
 
 
 def _video_fps(video: str) -> float:
@@ -675,30 +690,56 @@ def _video_fps(video: str) -> float:
 
 
 def _video_duration(video: str) -> float:
-    """Duration in seconds from container metadata (0.0 if unknown)."""
+    """Duration in seconds. Uses container metadata (fast, works for normal
+    files); falls back to reading packet timestamps with ffprobe for
+    variable-frame-rate clips like browser webcam WebM, whose containers
+    store no usable duration (OpenCV returns a garbage frame count).
+    Returns 0.0 only if both fail."""
     import cv2
 
     cap = cv2.VideoCapture(video)
     try:
         fps = cap.get(cv2.CAP_PROP_FPS) or 0.0
         frames = cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0.0
-        return frames / fps if fps > 0 and frames > 0 else 0.0
+        if fps > 0 and 0 < frames < 1e7:
+            return frames / fps
     finally:
         cap.release()
+    return _ffprobe_duration(video)
 
 
-def _duration_error(video: str):
+def _ffprobe_duration(video: str) -> float:
+    """Duration from the last video packet's timestamp (demux only, no pixel
+    decode). Robust for VFR/WebM. 0.0 if ffprobe is missing or fails."""
+    import shutil
+    import subprocess
+
+    if shutil.which("ffprobe") is None:
+        return 0.0
+    try:
+        out = subprocess.run(
+            ["ffprobe", "-v", "error", "-select_streams", "v:0",
+             "-show_entries", "packet=pts_time", "-of", "csv=p=0", video],
+            capture_output=True, text=True, timeout=30,
+        ).stdout
+    except (OSError, subprocess.SubprocessError):
+        return 0.0
+    times = [float(t) for t in out.split() if t and t != "N/A"]
+    return max(times) if times else 0.0
+
+
+def _duration_error(video: str, max_duration: float = MAX_DURATION_S):
     """Rejection message if the clip's length is outside the accepted range,
     None if acceptable (or the duration is unknown)."""
     duration = _video_duration(video)
     if duration and not (
         MIN_DURATION_S - DURATION_TOL_S
         <= duration
-        <= MAX_DURATION_S + DURATION_TOL_S
+        <= max_duration + DURATION_TOL_S
     ):
         return (
             f"Clip is {duration:.1f}s long; please use a clip between "
-            f"{MIN_DURATION_S:g}s and {MAX_DURATION_S:g}s."
+            f"{MIN_DURATION_S:g}s and {max_duration:g}s."
         )
     return None
 
@@ -755,6 +796,31 @@ def _new_request_dir() -> str:
     d = tempfile.mkdtemp(prefix="vsr-demo-")
     _REQUEST_DIRS.append(d)
     return d
+
+
+def _log_activity(path, source: str, word_confs, ood) -> None:
+    """Append one anonymous line per submission: timestamp, source
+    (upload/webcam), and the per-word confidence scores as bare numbers.
+    Deliberately content-free: no IP, no identity, and no words/transcript
+    (only the numeric confidences), so it keeps no recording of what was
+    said. 'ood' when the clip was flagged out-of-domain, '-' when there are
+    no scores."""
+    from datetime import datetime
+
+    if path is None:
+        return
+    if ood == "hide":
+        confs = "ood"
+    elif word_confs:
+        confs = ",".join(f"{c:.2f}" for _, c in word_confs)
+    else:
+        confs = "-"
+    line = "\t".join(
+        [datetime.now().isoformat(timespec="seconds"), source, confs]
+    )
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "a", encoding="utf-8") as f:
+        f.write(line + "\n")
 
 
 def _to_playable_mp4(src: str, out_dir=None):
@@ -817,73 +883,14 @@ def _frames_to_mp4(frames: np.ndarray, fps: int = 25, scale: int = 3, out_dir=No
     return out
 
 
-def _save_roi_data(roi: np.ndarray, video: str, save_dir: Path) -> str:
-    """Save the consented data as a single timestamped roi_<stamp>.mp4: the
-    mouth-ROI frames (T,H,W uint8) as pixel-exact lossless grayscale H.264 at
-    25 fps, muxed with the clip's audio track (AAC; omitted automatically if
-    the clip has none). The full face video is never stored. Note the audio is
-    voice, i.e. potentially identifying data -- the file is saved only with
-    the user's explicit consent, and its stem is the ID users quote to request
-    deletion. Returns that ID."""
-    import subprocess
-    from datetime import datetime
-
-    save_dir.mkdir(parents=True, exist_ok=True)
-    stamp = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
-    stem = f"roi_{stamp}"
-    dst = save_dir / f"{stem}.mp4"
-    T, H, W = roi.shape
-    cmd = [
-        "ffmpeg", "-y",
-        "-f", "rawvideo", "-pix_fmt", "gray", "-s", f"{W}x{H}",
-        "-r", f"{TARGET_FPS:g}", "-i", "pipe:0",
-        "-i", video,
-        "-map", "0:v", "-map", "1:a?",
-        "-c:v", "libx264", "-qp", "0", "-pix_fmt", "gray",
-        "-c:a", "aac", "-b:a", "192k",
-        str(dst),
-    ]
-    p = subprocess.run(
-        cmd, input=np.ascontiguousarray(roi, dtype=np.uint8).tobytes(),
-        capture_output=True,
-    )
-    if p.returncode != 0:
-        dst.unlink(missing_ok=True)
-        raise RuntimeError(
-            f"ffmpeg failed to save consented data: {p.stderr.decode()[-200:]}"
-        )
-    logging.info(f"Saved consented data with ID {stem} to {dst}")
-    return stem
-
-
-def _log_usage(save_dir: Path, source: str, duration: float, text: str,
-               saved_id: str) -> None:
-    """Append one line per completed recognition to save_dir/usage.log:
-    timestamp, source (upload/webcam), clip duration, saved-data ID ('-' if
-    nothing was saved), recognized text. Deliberately contains no visitor
-    identifiers (no IPs)."""
-    from datetime import datetime
-
-    save_dir.mkdir(parents=True, exist_ok=True)
-    line = "\t".join([
-        datetime.now().isoformat(timespec="seconds"),
-        source,
-        f"{duration:.1f}s",
-        saved_id or "-",
-        text,
-    ])
-    with open(save_dir / "usage.log", "a", encoding="utf-8") as f:
-        f.write(line + "\n")
-
-
 def launch_ui(reader: LipReader, example_paths=None,
-              hour_limit=5, day_limit=15):
+              hour_limit=5, day_limit=15, activity_log=None):
     import gradio as gr
 
-    def infer(video, consent, source, noise, blur, request: gr.Request):
+    def infer(video, source, noise, blur, request: gr.Request):
         # Last two slots: Submit interactivity and the input video itself
         # (cleared when the clip was the problem, kept otherwise).
-        blank = ("", None, None, None, "")
+        blank = ("", None, None, None)
         if not video:
             return (*blank, gr.update(interactive=False), gr.update())
         ip = _client_ip(request)
@@ -911,7 +918,7 @@ def launch_ui(reader: LipReader, example_paths=None,
             )
             return (*blank, gr.update(interactive=False), gr.update())
         try:
-            result = _infer(video, consent, source, noise, blur, sig)
+            result = _infer(video, source, noise, blur)
             if not local:
                 _mark_seen(ip, sig, noise, blur)
             return result
@@ -931,52 +938,49 @@ def launch_ui(reader: LipReader, example_paths=None,
             )
             return (*blank, gr.update(), None)
 
-    def _infer(video, consent, source, noise=0.0, blur=0.0, sig=None):
-        degraded = bool(noise or blur)
+    def _infer(video, source, noise=0.0, blur=0.0):
+        # Nothing of the user's is stored: the clip is recognized in memory
+        # and the only files written are transient outputs served back to the
+        # browser (auto-purged), plus an anonymous, content-free activity log
+        # (timestamp, upload/webcam, confidence numbers only).
         try:
-            text, roi, word_confs = reader.recognize(video, noise, blur)
+            text, roi, word_confs, ood = reader.recognize(video, noise, blur)
         except Exception as e:
             logging.exception(f"Recognition failed for {video}")
             raise gr.Error(f"Recognition failed: {e}")
-        saved_id = ""
-        if consent:
-            # Bundled examples are corpus data, not the visitor's to donate:
-            # consent cannot be given on their behalf, so never save them.
-            if (sig or _file_sig(video)) in example_sigs:
-                gr.Info("Example clips are never saved: they are corpus "
-                        "data, not yours to donate.")
-            elif degraded:
-                # Noise/blur-corrupted crops would pollute the dataset.
-                gr.Info("Degraded runs (noise/blur) are not saved; set both "
-                        "sliders to 0 to donate data.")
-            else:
-                try:
-                    saved_id = _save_roi_data(roi, video, reader.save_dir)
-                except Exception:
-                    logging.exception("Saving consented data failed")
-                    gr.Warning("Saving your data failed; nothing was stored.")
         try:
-            log_source = source + (
-                f"(noise={noise:g},blur={blur:g})" if degraded else ""
-            )
-            _log_usage(reader.save_dir, log_source, _video_duration(video),
-                       text, saved_id)
+            _log_activity(activity_log, source, word_confs, ood)
         except OSError:
-            logging.exception("Writing usage.log failed")  # non-fatal
+            logging.exception("Activity log write failed")  # non-fatal
+        if ood == "hide":
+            # Definitely not a GRID sentence: show nothing rather than a
+            # misleading confident guess. Clip stays loaded, Submit off.
+            gr.Warning(
+                "This doesn't look like a GRID sentence, so there's nothing "
+                "to show. Please speak a sentence in the fixed "
+                "command·colour·preposition·letter·digit·adverb pattern."
+            )
+            return ("", None, None, None,
+                    gr.update(interactive=False), gr.update())
+        if ood == "warn":
+            gr.Warning(
+                "This may not be a GRID sentence. The model only reads the "
+                "fixed command·colour·preposition·letter·digit·adverb "
+                "pattern, so the result below is just its closest guess."
+            )
         out_dir = _new_request_dir()
         return (
-            text,
+            text.title(),  # display: Title Case
             # Score in the text (gradio only tints, never prints, labels) plus
             # a bucket category for the colour: float labels tint red like a
             # saliency map, so use color_map'd buckets instead.
             [
-                (f"{w} {c:.2f}",
+                (f"{w.title()} {c:.2f}",
                  "high" if c >= 0.9 else "medium" if c >= 0.7 else "low")
                 for w, c in word_confs
             ] or None,
             _frames_to_mp4(roi, out_dir=out_dir),
             roi_strip(roi),
-            saved_id,
             # This clip is done; Submit stays off until a new one arrives
             # (re-enabled by video_in.change below). The clip stays loaded.
             gr.update(interactive=False),
@@ -986,14 +990,11 @@ def launch_ui(reader: LipReader, example_paths=None,
     # Example clips: GRID .mpg won't play in the browser, so show a transcoded
     # mp4 copy (kept for the server's lifetime) when ffmpeg is available.
     examples = []
-    example_sigs = set()  # content hashes of the bundled clips (see infer)
     for pth in example_paths or []:
         if not Path(pth).exists():
             logging.warning(f"Example clip not found, skipping: {pth}")
             continue
-        prepared = _to_playable_mp4(str(pth)) or str(pth)
-        examples.append([prepared])
-        example_sigs.update({_file_sig(str(pth)), _file_sig(prepared)})
+        examples.append([_to_playable_mp4(str(pth)) or str(pth)])
 
     # Only the input component has a .source-selection bar (upload/webcam
     # icons); keep it un-clipped and its icons comfortably visible.
@@ -1005,7 +1006,18 @@ def launch_ui(reader: LipReader, example_paths=None,
     video { object-fit: contain !important; }
     /* Never break a word-confidence chip across lines; wrap whole chips. */
     .word-conf span { display: inline-block; white-space: nowrap; }
-    .rec-text textarea { font-weight: bold; }
+    /* Prediction textbox: large and bold, it is the main output. */
+    .rec-text textarea { font-weight: 700; font-size: 1.5em; }
+    /* Bold every component title/label (Prediction, Word confidence, Mouth
+       ROI, sliders, ...) via gradio's own weight vars, not hashed classes. */
+    .gradio-container { --block-title-text-weight: 700;
+        --block-label-text-weight: 700; }
+    /* Privacy note: accent-tinted so it reads as a reassurance, not fine print. */
+    .privacy-note p { color: var(--color-accent); font-weight: 600;
+        margin: 4px 0; }
+    /* Highlight the grammar-constraint hint in the theme accent (matches the
+       'Try saying...' ticker); leave the heading default. */
+    .grammar-hint p { color: var(--color-accent); font-weight: 600; }
     /* Hide the gradio footer (Built with Gradio / Use via API / Settings). */
     footer { display: none !important; }
     /* Hide the video trim (scissors) control on the input player. */
@@ -1037,7 +1049,7 @@ def launch_ui(reader: LipReader, example_paths=None,
         const tick = () => {
           ticker.style.opacity = 0;
           setTimeout(() => {
-            ticker.textContent = 'Try saying: \\u201C' +
+            ticker.textContent = 'Try saying or whispering: \\u201C' +
               [pick(cmd), pick(col), pick(prep), pick(letters), pick(dig),
                pick(adv)].join(' ') + '\\u201D';
             ticker.style.opacity = 1;
@@ -1065,18 +1077,38 @@ def launch_ui(reader: LipReader, example_paths=None,
     # delete_cache purges gradio's upload/output cache (every 10 minutes,
     # files older than 15) -- gradio never cleans it on its own, and the
     # cache lives on a bounded tmpfs that upload bursts could otherwise fill.
+    # Vivid indigo accent so the primary Submit button reads as active (and
+    # its disabled state as muted-colour, not "broken"); recolours the ticker
+    # and grammar-hint accents to match.
+    theme = gr.themes.Default(primary_hue="indigo")
     with gr.Blocks(
         title="Can AI Read Your Lips? A Live Lipreading Demo "
               "(based on GRID corpus)",
-        delete_cache=(600, 900), css=css, js=js,
+        delete_cache=(600, 900), css=css, js=js, theme=theme,
     ) as demo:
-        gr.Markdown("# Can AI Read Your Lips? A Live Lipreading Demo "
-                    "(based on GRID corpus)")
+        gr.Markdown("# Can AI Read Your Lips?")
+        gr.Markdown(
+            "Live visual speech recognition on the GRID corpus.",
+            elem_classes=["subtitle"],
+        )
         with gr.Row():
             with gr.Column():
                 video_in = gr.Video(
                     label="Frontal talking-face clip", height=410
                 )
+                gr.Markdown(
+                    "🔒 *Your video is processed in memory and never "
+                    "stored. No recording, image, or transcript of what you "
+                    "submit is kept.*",
+                    elem_classes=["privacy-note"],
+                )
+                gr.Markdown(
+                    "*Best with a single frontal face in good lighting "
+                    f"({MIN_DURATION_S:g}–{MAX_DURATION_WEBCAM_S:g} s).*"
+                )
+                # "upload"/"webcam"; set by the upload/record events, used
+                # for the max-duration cap and the anonymous activity log.
+                source_state = gr.State("upload")
                 # Rotating grammar-valid sentence prompt (animated by js),
                 # so users know what to say before recording.
                 gr.HTML(
@@ -1084,9 +1116,6 @@ def launch_ui(reader: LipReader, example_paths=None,
                     'font-size:1.1em;font-weight:600;padding:6px 0;'
                     'min-height:1.4em;color:var(--color-accent)"></div>'
                 )
-                # Where the current clip came from ("upload"/"webcam"), for
-                # the per-source quota; set by the upload/record events below.
-                source_state = gr.State("upload")
                 if examples:
                     gr.Examples(
                         examples=examples, inputs=[video_in],
@@ -1103,8 +1132,7 @@ def launch_ui(reader: LipReader, example_paths=None,
                         "mouth region before the model reads it, so you can "
                         "see how much degradation it tolerates. The Mouth "
                         "ROI panels show exactly what the model received. "
-                        "Leave at 0 for normal recognition. Degraded clips "
-                        "are never saved."
+                        "Leave at 0 for normal recognition."
                     )
                     noise_sl = gr.Slider(0, 50, value=0, step=1,
                                          label="Noise (0 = none)")
@@ -1114,37 +1142,6 @@ def launch_ui(reader: LipReader, example_paths=None,
                 # start, on when the input changes, off again after infer.
                 submit = gr.Button("Submit", variant="primary",
                                    interactive=False)
-                gr.Markdown(
-                    "*Your video is processed and discarded; nothing is "
-                    "stored unless you opt in below.*"
-                )
-                # Consent flow lives behind this accordion so the default
-                # path shows no data-retention language at all; the few who
-                # want to contribute self-select into it.
-                with gr.Accordion(
-                    "Want to help the research? Donate your clip (optional)",
-                    open=False,
-                ):
-                    save_cb = gr.Checkbox(
-                        label="Tick this box if you consent to the cropped "
-                              "mouth-region frames and the clip's audio "
-                              "track being saved on the server for "
-                              "lipreading and audio-visual speech research. "
-                              "The full video is not stored; note that a "
-                              "voice recording may be identifying. Consent "
-                              "only applies to videos of yourself that you "
-                              "recorded: you cannot consent on behalf of "
-                              "other people or for clips taken from "
-                              "datasets.",
-                        value=False,
-                    )
-                    saved_out = gr.Textbox(
-                        label="Saved data ID (quote this to request "
-                              "deletion)",
-                        interactive=False,
-                    )
-                    with gr.Accordion("Privacy notice", open=False):
-                        gr.Markdown(PRIVACY_NOTICE_MD)
             with gr.Column():
                 with gr.Row():
                     roi_vid = gr.Video(
@@ -1152,7 +1149,7 @@ def launch_ui(reader: LipReader, example_paths=None,
                         show_download_button=False, height=240, scale=1,
                     )
                     with gr.Column(scale=2):
-                        text_out = gr.Textbox(label="Recognised text",
+                        text_out = gr.Textbox(label="Prediction",
                                               elem_classes=["rec-text"])
                         conf_out = gr.HighlightedText(
                             label="Word confidence",
@@ -1167,41 +1164,50 @@ def launch_ui(reader: LipReader, example_paths=None,
                     height=140, show_download_button=False,
                 )
                 # Grammar: the FST drawing is always visible, filling the
-                # space beside the consent area; word tables sit behind the
+                # space in the input column; word tables sit behind the
                 # accordion.
                 gr.Markdown(
                     "### Valid GRID sentence structure\n"
                     "The model only understands 6-word sentences that follow "
                     "the pattern below, one word from each column, e.g. "
                     "**“place green with h eight now”** or "
-                    "**“bin blue at f two now”**."
+                    "**“bin blue at f two now”**.",
+                    elem_classes=["grammar-hint"],
                 )
                 gr.HTML(_grammar_fst_svg())
                 with gr.Accordion("Full grammar description", open=False):
                     gr.Markdown(GRID_GRAMMAR_MD)
         gr.Markdown(ACKNOWLEDGEMENTS_MD)
 
-        def check_length(video):
-            """Reject out-of-range clips as soon as they are uploaded, before
-            Submit: warn and clear the input. recognize() re-checks as a
-            backstop for the CLI/API path."""
+        def check_length(video, source):
+            """Reject out-of-range clips as soon as they are supplied (by
+            upload or by webcam recording), before Submit: warn and clear
+            the input. recognize() re-checks as a backstop for the CLI/API
+            path. `source` selects the max-duration cap (webcam gets more)
+            and is recorded, so it is echoed into source_state."""
             if video:
+                max_dur = (MAX_DURATION_WEBCAM_S if source == "webcam"
+                           else MAX_DURATION_S)
                 try:
-                    err = _duration_error(video)
+                    err = _duration_error(video, max_dur)
                 except Exception:
-                    logging.exception(f"Could not read uploaded clip {video}")
-                    gr.Warning("This video file could not be read; please "
-                               "try a different file or format.")
-                    return None, "upload"
+                    logging.exception(f"Could not read clip {video}")
+                    gr.Warning("This video could not be read; please try a "
+                               "different file or recording.")
+                    return None, source
                 if err:
                     gr.Warning(err)
-                    return None, "upload"
-            return video, "upload"
+                    return None, source
+            return video, source
 
         video_in.upload(
-            check_length, inputs=[video_in], outputs=[video_in, source_state]
+            lambda v: check_length(v, "upload"),
+            inputs=[video_in], outputs=[video_in, source_state],
         )
-        video_in.stop_recording(lambda: "webcam", outputs=[source_state])
+        video_in.stop_recording(
+            lambda v: check_length(v, "webcam"),
+            inputs=[video_in], outputs=[video_in, source_state],
+        )
         # Fires on any new value (upload, webcam recording, example click)
         # and on clearing: Submit is usable exactly when a clip is loaded,
         # and results from the previous clip are cleared.
@@ -1212,13 +1218,11 @@ def launch_ui(reader: LipReader, example_paths=None,
                 None,  # word confidence
                 None,  # ROI video
                 None,  # ROI strip
-                "",    # saved data ID
             )
 
         video_in.change(
             on_clip_change, inputs=[video_in],
-            outputs=[submit, text_out, conf_out, roi_vid, strip_out,
-                     saved_out],
+            outputs=[submit, text_out, conf_out, roi_vid, strip_out],
         )
         # Changing the degradation makes re-submitting the same clip a new
         # experiment, so it re-enables Submit (if a clip is loaded).
@@ -1229,8 +1233,8 @@ def launch_ui(reader: LipReader, example_paths=None,
             )
         submit.click(
             infer,
-            inputs=[video_in, save_cb, source_state, noise_sl, blur_sl],
-            outputs=[text_out, conf_out, roi_vid, strip_out, saved_out,
+            inputs=[video_in, source_state, noise_sl, blur_sl],
+            outputs=[text_out, conf_out, roi_vid, strip_out,
                      submit, video_in],
         )
     # One GPU inference at a time with a bounded waiting line (visitors see
@@ -1270,11 +1274,6 @@ def get_args() -> argparse.Namespace:
                    help="Scale the mouth crop to the detected face size (IOD) so "
                         "the mouth-to-head ratio matches GRID for arbitrary "
                         "videos. No-op for GRID-sized faces. Default: %(default)s")
-    p.add_argument("--save-dir", type=Path, default=Path("demo_saved"),
-                   help="Server-side dir where consented data is saved: one "
-                        ".mp4 per clip (lossless mouth-ROI video + audio "
-                        "track). The full video is never stored. "
-                        "Default: %(default)s")
     # Model geometry -- must match the trained checkpoint.
     p.add_argument("--encoder-dim", type=int, default=128)
     p.add_argument("--num-encoder-layers", type=int, default=6)
@@ -1287,6 +1286,11 @@ def get_args() -> argparse.Namespace:
     p.add_argument("--max-per-day", type=int, default=15,
                    help="UI quota: videos (uploaded or recorded) allowed "
                         "per visitor (IP) per day.")
+    p.add_argument("--activity-log", type=Path,
+                   default=Path("demo_saved/activity.log"),
+                   help="Append an anonymous line per UI submission "
+                        "(timestamp, upload/webcam, confidence numbers only; "
+                        "no content, no IP). Pass '' to disable.")
     p.add_argument("--examples", type=Path, nargs="*",
                    default=[Path("grid-corpus/s1/bbaf2n.mpg"),
                             Path("grid-corpus/s2/sgbp4s.mpg"),
@@ -1310,14 +1314,20 @@ def main():
 
     if args.ui:
         launch_ui(reader, args.examples,
-                  args.max_per_hour, args.max_per_day)
+                  args.max_per_hour, args.max_per_day,
+                  args.activity_log if str(args.activity_log) else None)
     else:
         if args.video is None:
             raise SystemExit("Provide a video path, or pass --ui for the web UI.")
-        text, _, word_confs = reader.recognize(args.video)
-        print(text)
-        if word_confs:
-            print(" ".join(f"{w}({c:.2f})" for w, c in word_confs))
+        text, _, word_confs, ood = reader.recognize(args.video)
+        if ood == "hide":
+            print("[out-of-domain] not a GRID sentence; no result shown")
+        else:
+            print(text)
+            if word_confs:
+                print(" ".join(f"{w}({c:.2f})" for w, c in word_confs))
+            if ood == "warn":
+                print("[warning] may not be a GRID sentence")
 
 
 if __name__ == "__main__":

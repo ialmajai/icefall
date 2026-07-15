@@ -274,7 +274,7 @@ def _open_video(path: Path) -> cv2.VideoCapture:
     return cap
 
 
-def _detect_landmarks(video_path: Path, dlib_detector,  dlib_predictor, detect_every: int, detect_height: int | None = None) -> np.ndarray | None:
+def _detect_landmarks(video_path: Path, dlib_detector,  dlib_predictor, detect_every: int, detect_height: int | None = None, cnn_detector=None) -> np.ndarray | None:
     """
     Run dlib face + landmark detection on every ``detect_every``-th frame.
 
@@ -282,6 +282,11 @@ def _detect_landmarks(video_path: Path, dlib_detector,  dlib_predictor, detect_e
     pixels) face *detection* runs on a copy downscaled to that height, while
     the landmark predictor still runs at full resolution for precision.
     Landmarks are always in original-frame coordinates.
+
+    If ``cnn_detector`` (a dlib ``cnn_face_detection_model_v1``) is given, it
+    is tried per frame only when the fast HOG detector finds nothing -- it is
+    far more robust to glasses, tight framing and mild pose, but slower, so it
+    runs as a fallback rather than the default.
 
     Returns an ``(T, 68, 2)`` int array, or ``None`` if no face was detected
     on the first keyed frame.
@@ -306,15 +311,26 @@ def _detect_landmarks(video_path: Path, dlib_detector,  dlib_predictor, detect_e
                         gray, (round(gray.shape[1] * scale), detect_height)
                     )
                 faces = dlib_detector(small)
-                if not faces:
+                if faces:
+                    face = faces[0]
+                    if scale != 1.0:
+                        face = dlib.rectangle(
+                            round(face.left() / scale),
+                            round(face.top() / scale),
+                            round(face.right() / scale),
+                            round(face.bottom() / scale),
+                        )
+                elif cnn_detector is not None:
+                    # HOG found nothing: fall back to the CNN detector on the
+                    # full-resolution frame (its box is already in orig coords).
+                    dets = cnn_detector(gray)
+                    if not dets:
+                        logging.warning(f"No face detected in {video_path} at frame {frame_idx}.")
+                        return None
+                    face = dets[0].rect
+                else:
                     logging.warning(f"No face detected in {video_path} at frame {frame_idx}.")
                     return None
-                face = faces[0]
-                if scale != 1.0:
-                    face = dlib.rectangle(
-                        round(face.left() / scale), round(face.top() / scale),
-                        round(face.right() / scale), round(face.bottom() / scale),
-                    )
                 shape = dlib_predictor(gray, face)
                 last_lm = np.array([[p.x, p.y] for p in shape.parts()])
 
