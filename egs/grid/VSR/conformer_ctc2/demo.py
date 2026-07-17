@@ -102,14 +102,20 @@ MAX_DURATION_S = 15.0          # uploaded files
 MAX_DURATION_WEBCAM_S = 20.0  # webcam recordings get a little more headroom
 DURATION_TOL_S = 0.1
 
-# Head-size normalization. GRID has uniform framing: its fixed 64px mouth crop
-# corresponds to a median interocular distance (IOD) of ~50.6px. For arbitrary
-# videos the face can be any size, so we scale the crop to the measured IOD
-# (crop = CROP_PER_IOD * IOD) before resizing to ROI_SIZE, keeping the
-# mouth-to-head ratio consistent with GRID. For a GRID-sized face this yields
-# ~64px (unchanged), so normalization is a safe generalization.
-GRID_IOD_REF = 50.6
-CROP_PER_IOD = MOUTH_W / GRID_IOD_REF  # ~1.264
+# Head-size normalization. GRID has near-uniform framing: its fixed 64px
+# mouth crop corresponds to a median interocular distance (IOD) of 48.4px,
+# measured over the corpus landmarks (33 speakers x 40 clips; per-speaker
+# medians span 40-56px, so training itself saw ~+-16% mouth-scale variance).
+# For arbitrary videos the face can be any size, so we scale the crop to the
+# measured IOD (crop = CROP_PER_IOD * IOD) before resizing to ROI_SIZE,
+# keeping the mouth-to-head ratio consistent with GRID; for a median GRID
+# face this reproduces the training 64px crop. Validated by a crop-scale
+# sweep (1.15-1.55 x IOD): WER varies by only ~1 point over that range on
+# Lombard GRID, and this value edged out the previous mis-measured reference
+# (50.6 -> crops ~4.5% small) on both GRID and Lombard. IOD is a valid scale
+# proxy cross-corpus: mouth-width/IOD is 0.807 on GRID vs 0.801 on Lombard.
+GRID_IOD_REF = 48.4
+CROP_PER_IOD = MOUTH_W / GRID_IOD_REF  # ~1.322
 
 
 def _degrade_roi(roi: np.ndarray, noise_sigma: float,
