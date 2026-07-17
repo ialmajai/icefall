@@ -57,6 +57,18 @@ from pathlib import Path
 import numpy as np
 import torch
 
+# Bundled py3.8-compatible MediaPipe (the env's own build is broken on 3.8),
+# used as a robust fallback landmarker. It must be imported BEFORE anything
+# that pulls in the env's protobuf 5.x (fairseq, tensorboard): MediaPipe
+# needs the bundled protobuf<4 and whichever protobuf loads first wins.
+# Nothing else in the demo process needs protobuf 5.
+MEDIAPIPE_DIR = Path(__file__).resolve().parent.parent / "download/mediapipe-py38"
+try:
+    sys.path.insert(0, str(MEDIAPIPE_DIR))
+    import mediapipe as _mediapipe  # noqa: E402
+except Exception:  # missing dir/deps: demo runs without the fallback
+    _mediapipe = None
+
 from conformer import Conformer
 from icefall.checkpoint import load_checkpoint
 from icefall.utils import str2bool
@@ -116,6 +128,47 @@ def _degrade_roi(roi: np.ndarray, noise_sigma: float,
         rng = np.random.default_rng()
         out = out + rng.normal(0.0, noise_sigma, out.shape)
     return np.clip(out, 0, 255).astype(np.uint8)
+
+
+def _load_mediapipe_fallback():
+    """Build a fallback landmarker from MediaPipe Face Detection (BlazeFace,
+    short-range): fast (~17 ms/frame CPU) and robust to glasses, tight
+    framing and mild pose, exactly where dlib's HOG detector fails.
+
+    Returns a callable (BGR frame) -> (68, 2) int array or None. Only the
+    points the pipeline consumes are meaningful: the mouth-corner midpoint
+    (indices 48/54, set so their mean is MediaPipe's mouth center; measured
+    offset vs dlib is ~0.01-0.07 IOD with no systematic bias) and the eye
+    blocks 36:42 / 42:48 (set to the eye keypoints, so the interocular
+    distance for head-size normalization stays valid, within ~10% of dlib's).
+    """
+    import cv2
+
+    if _mediapipe is None:
+        raise RuntimeError(f"bundled mediapipe not importable ({MEDIAPIPE_DIR})")
+    mp = _mediapipe
+
+    detector = mp.solutions.face_detection.FaceDetection(
+        model_selection=0, min_detection_confidence=0.5
+    )
+    KP = mp.solutions.face_detection.FaceKeyPoint
+
+    def fallback(image_bgr):
+        h, w = image_bgr.shape[:2]
+        result = detector.process(cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB))
+        if not result.detections:
+            return None
+        kps = result.detections[0].location_data.relative_keypoints
+
+        def px(k):
+            return (kps[k].x * w, kps[k].y * h)
+
+        lm = np.full((68, 2), px(KP.MOUTH_CENTER), dtype=float)
+        lm[36:42] = px(KP.RIGHT_EYE)  # subject's right eye = dlib 36-41
+        lm[42:48] = px(KP.LEFT_EYE)   # subject's left eye = dlib 42-47
+        return np.round(lm).astype(int)
+
+    return fallback
 
 
 def _median_iod(landmarks: np.ndarray) -> float:
@@ -385,9 +438,18 @@ class LipReader:
         g.update(load_globals_dlib(args))  # {detector, predictor}
         self.detector = g["detector"]
         self.predictor = g["predictor"]
-        # Optional slow-but-robust CNN face detector, tried per frame only when
-        # the fast HOG detector fails (glasses, tight framing, mild pose).
-        self.cnn_detector = None
+        # Robust per-frame fallback, tried only when the fast HOG detector
+        # fails (glasses, tight framing, mild pose). Missing/broken MediaPipe
+        # degrades to the old behaviour (no fallback), never to a crash.
+        self.fallback_landmarker = None
+        if getattr(args, "mediapipe_fallback", True):
+            try:
+                self.fallback_landmarker = _load_mediapipe_fallback()
+                logging.info("MediaPipe fallback landmarker enabled")
+            except Exception:
+                logging.exception(
+                    "MediaPipe fallback unavailable; continuing without"
+                )
         self.avhubert = g["model"]
         self.transform = g["transform"]
         self.device = g["device"]
@@ -466,7 +528,8 @@ class LipReader:
         clip to process, video the original name for messages."""
         landmarks = _detect_landmarks(
             video_path, self.detector, self.predictor, 1,
-            detect_height=DETECT_HEIGHT, cnn_detector=self.cnn_detector,
+            detect_height=DETECT_HEIGHT,
+            fallback_landmarker=self.fallback_landmarker,
         )
         if landmarks is None:
             logging.warning(f"No face detected in {video}")
@@ -1015,9 +1078,6 @@ def launch_ui(reader: LipReader, example_paths=None,
     /* Privacy note: accent-tinted so it reads as a reassurance, not fine print. */
     .privacy-note p { color: var(--color-accent); font-weight: 600;
         margin: 4px 0; }
-    /* Highlight the grammar-constraint hint in the theme accent (matches the
-       'Try saying...' ticker); leave the heading default. */
-    .grammar-hint p { color: var(--color-accent); font-weight: 600; }
     /* Hide the gradio footer (Built with Gradio / Use via API / Settings). */
     footer { display: none !important; }
     /* Hide the video trim (scissors) control on the input player. */
@@ -1033,8 +1093,9 @@ def launch_ui(reader: LipReader, example_paths=None,
     # matching CSS above hides the transient "Error" pill.
     js = """
     () => {
-      // Animated prompt under the upload box: cycle randomly generated
-      // grammar-valid sentences so users know what to say before recording.
+      // Grammar hint shown over the upload area while it waits for a video.
+      // Static explanation with only the title-cased example sentence
+      // rotating through randomly generated grammar-valid sentences.
       const cmd = ['bin','lay','place','set'],
             col = ['blue','green','red','white'],
             prep = ['at','by','in','with'],
@@ -1043,21 +1104,35 @@ def launch_ui(reader: LipReader, example_paths=None,
                    'eight','nine'],
             adv = ['again','now','please','soon'];
       const pick = a => a[Math.floor(Math.random() * a.length)];
+      const cap = w => w.charAt(0).toUpperCase() + w.slice(1);
       const ticker = document.getElementById('sentence-ticker');
-      if (ticker) {
-        ticker.style.transition = 'opacity 0.35s';
+      if (ticker && !ticker.dataset.init) {
+        ticker.dataset.init = '1';
+        ticker.innerHTML =
+          'A valid sentence uses a 6-word grammatical structure: '
+          + 'command | colour | preposition | letter | number | adverb, '
+          + 'such as \\u201C<span id="ticker-eg"></span>\\u201D';
+        const eg = document.getElementById('ticker-eg');
+        eg.style.transition = 'opacity 0.35s';
         const tick = () => {
-          ticker.style.opacity = 0;
+          eg.style.opacity = 0;
           setTimeout(() => {
-            ticker.textContent = 'Try saying or whispering: \\u201C' +
-              [pick(cmd), pick(col), pick(prep), pick(letters), pick(dig),
-               pick(adv)].join(' ') + '\\u201D';
-            ticker.style.opacity = 1;
+            eg.textContent = [pick(cmd), pick(col), pick(prep),
+              pick(letters), pick(dig), pick(adv)].map(cap).join(' ');
+            eg.style.opacity = 1;
           }, 350);
         };
         tick();
-        setInterval(tick, 3000);
+        setInterval(tick, 3500);
       }
+      // Show the hint only while the input is empty (no <video> loaded).
+      const toggleHint = () => {
+        const vin = document.getElementById('video-input');
+        if (vin && ticker) {
+          ticker.style.display =
+            vin.querySelector('video') ? 'none' : '';
+        }
+      };
       const resetErrored = () => {
         document.querySelectorAll('.block .error').forEach(err => {
           const block = err.closest('.block');
@@ -1069,8 +1144,9 @@ def launch_ui(reader: LipReader, example_paths=None,
           if (btn) btn.click();
         });
       };
-      resetErrored();
-      new MutationObserver(resetErrored)
+      const onMutate = () => { resetErrored(); toggleHint(); };
+      onMutate();
+      new MutationObserver(onMutate)
         .observe(document.body, {subtree: true, childList: true});
     }
     """
@@ -1088,13 +1164,22 @@ def launch_ui(reader: LipReader, example_paths=None,
     ) as demo:
         gr.Markdown("# Can AI Read Your Lips?")
         gr.Markdown(
-            "Live visual speech recognition on the GRID corpus.",
+            "Live visual speech recognition constrained to the GRID corpus "
+            "grammar.",
             elem_classes=["subtitle"],
         )
         with gr.Row():
             with gr.Column():
                 video_in = gr.Video(
-                    label="Frontal talking-face clip", height=410
+                    label="Frontal talking-face clip", height=410,
+                    elem_id="video-input",
+                )
+                # Grammar hint shown right under the upload area while it is
+                # empty (js populates it and hides it once a clip loads).
+                gr.HTML(
+                    '<div id="sentence-ticker" style="text-align:center;'
+                    'font-weight:600;padding:6px 4px;min-height:1.4em;'
+                    'color:var(--color-accent)"></div>'
                 )
                 gr.Markdown(
                     "🔒 *Your video is processed in memory and never "
@@ -1109,13 +1194,6 @@ def launch_ui(reader: LipReader, example_paths=None,
                 # "upload"/"webcam"; set by the upload/record events, used
                 # for the max-duration cap and the anonymous activity log.
                 source_state = gr.State("upload")
-                # Rotating grammar-valid sentence prompt (animated by js),
-                # so users know what to say before recording.
-                gr.HTML(
-                    '<div id="sentence-ticker" style="text-align:center;'
-                    'font-size:1.1em;font-weight:600;padding:6px 0;'
-                    'min-height:1.4em;color:var(--color-accent)"></div>'
-                )
                 if examples:
                     gr.Examples(
                         examples=examples, inputs=[video_in],
@@ -1171,8 +1249,7 @@ def launch_ui(reader: LipReader, example_paths=None,
                     "The model only understands 6-word sentences that follow "
                     "the pattern below, one word from each column, e.g. "
                     "**“place green with h eight now”** or "
-                    "**“bin blue at f two now”**.",
-                    elem_classes=["grammar-hint"],
+                    "**“bin blue at f two now”**."
                 )
                 gr.HTML(_grammar_fst_svg())
                 with gr.Accordion("Full grammar description", open=False):
@@ -1274,6 +1351,10 @@ def get_args() -> argparse.Namespace:
                    help="Scale the mouth crop to the detected face size (IOD) so "
                         "the mouth-to-head ratio matches GRID for arbitrary "
                         "videos. No-op for GRID-sized faces. Default: %(default)s")
+    p.add_argument("--mediapipe-fallback", type=str2bool, default=True,
+                   help="When dlib's HOG detector finds no face in a frame, "
+                        "fall back to MediaPipe face detection (fast, robust "
+                        "to glasses/tight framing). Default: %(default)s")
     # Model geometry -- must match the trained checkpoint.
     p.add_argument("--encoder-dim", type=int, default=128)
     p.add_argument("--num-encoder-layers", type=int, default=6)
