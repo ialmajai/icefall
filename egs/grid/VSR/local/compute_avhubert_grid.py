@@ -88,6 +88,18 @@ def parse_args() -> argparse.Namespace:
              "Default: %(default)s",
     )
     parser.add_argument(
+        "--roi-mode",
+        choices=["centroid", "meanface"],
+        default="centroid",
+        help="Mouth-ROI geometry. 'centroid': crop --mouth-w/h around the "
+             "mouth centre from dlib landmarks (the original method). "
+             "'meanface': canonical AV-HuBERT preprocessing -- landmarks "
+             "warped onto a mean face before a fixed mouth crop -- read from "
+             "the <clip>.mfroi.npz caches produced by the ssl-kaldi recipe "
+             "(no landmark detection or cropping is done here). "
+             "Default: %(default)s",
+    )
+    parser.add_argument(
         "--feats-dir",
         type=Path,
         required=True,
@@ -187,6 +199,7 @@ def extract_features_from_visual(
     mouth_w: int = 64,
     mouth_h: int = 64,
     detect_every: int = 1,
+    roi_mode: str = "centroid",
 ) -> np.ndarray | None:
     """
     Extract AV-HuBERT features from the mouth ROI of a video.
@@ -219,8 +232,20 @@ def extract_features_from_visual(
     landmarks_file = video_path.with_suffix(".landmarks.npz")
     mouth_frames_file = video_path.with_suffix(".mouth_frames.npz")
 
+    if roi_mode == "meanface":
+        # Mean-face-aligned ROIs, precomputed by the ssl-kaldi recipe's
+        # align_mouth port (landmark interpolation -> temporal smoothing ->
+        # similarity warp onto the mean face -> 96x96 mouth crop -> 88x88
+        # centre crop). Stored raw as uint8, unlike .mouth_frames.npz which
+        # already holds transform()ed floats, so normalise here.
+        mfroi_file = video_path.with_suffix(".mfroi.npz")
+        if not mfroi_file.exists():
+            logging.warning(f"Skipping {video}: no mean-face ROI cache "
+                            f"({mfroi_file.name}).")
+            return None
+        frames = transform(np.load(mfroi_file)["roi"])
     # Mouth frames (or cache load)
-    if mouth_frames_file.exists():
+    elif mouth_frames_file.exists():
         frames = list(np.load(mouth_frames_file)["frames"])
         logging.info(f"Loaded cached mouth frames from {mouth_frames_file}.")
     else:
@@ -417,7 +442,8 @@ def process_worker(args: tuple) -> list:
     - Duplicates the first frame if only 74 frames are returned (expects 75).
     - All cuts are assigned a fixed duration of 3.0 s at 25 fps.
     """
-    worker_id, recordings_subset, supervisions_subset, feats_dir, partition, layer = args
+    (worker_id, recordings_subset, supervisions_subset, feats_dir, partition,
+     layer, roi_mode) = args
     # Access resources initialised by _worker_init
     model     = _worker_globals["model"]
     transform = _worker_globals["transform"]
@@ -441,7 +467,7 @@ def process_worker(args: tuple) -> list:
                 continue
             try:
                 feats = extract_features_from_visual(recording.sources[0].source, detector, \
-                    predictor, device, model, transform, layer)
+                    predictor, device, model, transform, layer, roi_mode=roi_mode)
 
                 if feats is None:
                     logging.warning(
@@ -481,7 +507,7 @@ def process_worker(args: tuple) -> list:
                 )
 
     logging.info(
-        f"Worker {worker_id} finished — wrote {len(video_cuts)} cuts to {h5_path}"
+        f"Worker {worker_id} finished, wrote {len(video_cuts)} cuts to {h5_path}"
     )
     return video_cuts
 
@@ -536,8 +562,8 @@ def compute_avhubert_grid():
                 supervisions[start:end],
                 feats_dir,
                 partition,
-                args.layer, 
-                
+                args.layer,
+                args.roi_mode,
             ))
 
         all_cuts = []

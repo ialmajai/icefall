@@ -108,10 +108,23 @@ def get_parser():
     parser.add_argument(
         "--num-decoder-layers",
         type=int,
-        default=6,
+        default=3,
         help="""Number of decoder layer of transformer decoder.
-        Setting this to 0 will not create the decoder at all (pure CTC model)
+        Setting this to 0 will not create the decoder at all (pure CTC model).
+        Must match the checkpoint; the default tracks train.py/decode.py
+        (it was 6 here and 3 there until 2026-09-01).
         """,
+    )
+
+    parser.add_argument(
+        "--encoder-dim",
+        type=int,
+        default=128,
+        help="""Conformer attention dim; must match the checkpoint's training
+        value, same as train.py/decode.py. Lives here rather than in
+        decode.get_params(), which is where this script reads the rest of the
+        model geometry from; when it moved to a decode.py CLI flag this script
+        was left reading an attribute that no longer existed.""",
     )
 
     parser.add_argument(

@@ -72,6 +72,8 @@ from lhotse.utils import fix_random_seed
 from lhotse.dataset.sampling.base import CutSampler
 from lhotse.cut import Cut
 from conformer import Conformer
+from cmn import apply_cmn
+from grid_phonemes import NUM_PHONEME_CLASSES, text_to_phoneme_ids
 from asr_datamodule import GridAsrDataModule
 import torch.nn as nn
 import torch.multiprocessing as mp
@@ -82,7 +84,7 @@ import logging
 import warnings
 from pathlib import Path
 from shutil import copyfile
-from typing import Any, Dict, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import k2
 import optim
@@ -99,6 +101,87 @@ warnings.filterwarnings("ignore", module="torch.nn.functional")
 
 
 LRSchedulerType = Union[torch.optim.lr_scheduler._LRScheduler, optim.LRScheduler]
+
+
+class _GradReverse(torch.autograd.Function):
+    """Identity forward, negated (and scaled) gradient backward."""
+
+    @staticmethod
+    def forward(ctx, x, lambd):
+        ctx.lambd = lambd
+        return x.view_as(x)
+
+    @staticmethod
+    def backward(ctx, grad_out):
+        return grad_out.neg() * ctx.lambd, None
+
+
+class SpeakerAdversary(nn.Module):
+    """Speaker classifier behind a gradient-reversal layer.
+
+    Deliberately kept OUTSIDE the Conformer so the saved checkpoint stays a
+    plain recognition model -- decode.py and demo.py load it unchanged, with no
+    unexpected-key errors and nothing to strip at export time.
+    """
+
+    def __init__(self, d_model: int, num_speakers: int, hidden: int = 256):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(d_model, hidden), nn.ReLU(), nn.Linear(hidden, num_speakers)
+        )
+
+    def forward(self, pooled: torch.Tensor, lambd: float) -> torch.Tensor:
+        return self.net(_GradReverse.apply(pooled, lambd))
+
+
+# Set once in run() when --speaker-adv-weight > 0; read by compute_loss.
+# Module-level rather than threaded through train_one_epoch/compute_loss/
+# compute_validation_loss signatures, and NOT put in `params` because that dict
+# is pickled into every checkpoint.
+_SPK_ADV = None          # SpeakerAdversary
+_SPK_IDS = None          # {speaker string -> class index}
+
+
+def parse_dropout_schedule(spec: str):
+    """Kaldi's `0,0@0.20,0.5@0.50,0` -> [(fraction, value), ...] sorted by
+    fraction. A bare value takes the next implicit position: the first is at
+    fraction 0 and the last at 1."""
+    if not spec:
+        return []
+    raw = [tok.strip() for tok in spec.split(",") if tok.strip()]
+    pts, implicit = [], []
+    for i, tok in enumerate(raw):
+        if "@" in tok:
+            val, frac = tok.split("@")
+            pts.append((float(frac), float(val)))
+        else:
+            implicit.append((i, float(tok)))
+    for i, val in implicit:
+        pts.append((0.0 if i == 0 else 1.0, val))
+    return sorted(pts)
+
+
+def dropout_at(points, frac: float) -> float:
+    """Linear interpolation of the schedule at a training fraction."""
+    if frac <= points[0][0]:
+        return points[0][1]
+    if frac >= points[-1][0]:
+        return points[-1][1]
+    for (f0, v0), (f1, v1) in zip(points, points[1:]):
+        if f0 <= frac <= f1:
+            if f1 == f0:
+                return v1
+            return v0 + (v1 - v0) * (frac - f0) / (f1 - f0)
+    return points[-1][1]
+
+
+def set_dropout(model, p: float) -> int:
+    n = 0
+    for m in model.modules():
+        if isinstance(m, nn.Dropout):
+            m.p = p
+            n += 1
+    return n
 
 
 def get_parser():
@@ -198,11 +281,103 @@ def get_parser():
     )
 
     parser.add_argument(
+        "--encoder-dim",
+        type=int,
+        default=128,
+        help="""Conformer attention dim. The 768-dim SSL features are
+        projected to this by a learned linear layer before the encoder.
+        decode.py must be given the same value. Default: %(default)s""",
+    )
+
+    parser.add_argument(
+        "--dropout",
+        type=float,
+        default=0.1,
+        help="""Dropout inside the conformer encoder (also used for
+        layer-dropout). Default: %(default)s""",
+    )
+
+    parser.add_argument(
+        "--layer-dropout",
+        type=float,
+        default=None,
+        help="""Layer-dropout rate, overriding --dropout for the whole-layer
+        stochastic-depth knob only. Default: None, meaning follow --dropout
+        (the historical behaviour where one flag sets both).""",
+    )
+
+    parser.add_argument(
+        "--speaker-adv-weight",
+        type=float,
+        default=0.0,
+        help="""Weight of a speaker-adversarial branch on the encoder output
+        (gradient-reversal). A classifier is trained to identify the training
+        speaker from the mean-pooled encoder representation, while the reversed
+        gradient pushes the encoder to destroy that information. 0 disables it.
+
+        Motivation: a linear probe recovers the speaker from this recipe's
+        encoder at 92.8% (chance 3.4%), 53.2% even with dropout 0.4, and OOD
+        WER tracks that number. ssl-kaldi's systems score *better* on Lombard
+        than in-domain (ratio 0.74-0.95x) where ours is 1.17x at best, which is
+        what a speaker-invariant representation would buy.
+
+        NOTE: values are not comparable across 2026-09-01. Before that date the
+        adversarial term was added at cross_entropy's mean scale against a
+        sum-reduced recognition loss, so the effective weight was this value
+        divided by the batch frame count (~1e4). It is now a true relative
+        weight, so start around 0.1-1.0 rather than the old 3-10.""",
+    )
+
+    parser.add_argument(
+        "--speaker-adv-hidden",
+        type=int,
+        default=256,
+        help="Hidden width of the adversarial speaker classifier.",
+    )
+
+    parser.add_argument(
+        "--dropout-schedule",
+        type=str,
+        default="",
+        help="""Kaldi-style dropout schedule, e.g. "0,0@0.20,0.5@0.50,0":
+        piecewise-linear (value@training-fraction) points, interpolated and
+        applied to every nn.Dropout at each epoch start. ssl-kaldi's chain
+        recipe uses exactly this shape, and its robustness may come from the
+        ramp rather than from a constant rate. Empty (the default) keeps
+        --dropout fixed.""",
+    )
+
+    parser.add_argument(
+        "--cmn",
+        choices=["none", "utt"],
+        default="none",
+        help="""Cepstral mean normalisation of the AV-HuBERT features, as
+        Kaldi's apply-cmvn does before its acoustic model. 'utt' subtracts
+        each utterance's own mean over time; 'none' keeps the raw features.
+        decode.py and demo.py must be given the same value.
+        Default: %(default)s""",
+    )
+
+    parser.add_argument(
         "--att-rate",
         type=float,
         default=0.5,
         help="""The attention rate.
         The total loss is (1 -  att_rate) * ctc_loss + att_rate * att_loss
+        """,
+    )
+
+    parser.add_argument(
+        "--phoneme-ctc-weight",
+        type=float,
+        default=0.0,
+        help="""Weight of an auxiliary CTC loss over CMUdict phonemes
+        (conformer_ctc2/grid_phonemes.py), added on top of the main
+        (BPE-CTC + attention) loss: loss += phoneme_ctc_weight *
+        phoneme_ctc_loss. 0.0 (the default) disables it entirely -- no
+        phoneme head is built and no extra loss is computed. Idea borrowed
+        from VALLR (phoneme units are more speaker-invariant than
+        word-piece units).
         """,
     )
 
@@ -531,6 +706,11 @@ def compute_loss(
     supervisions = batch["supervisions"]
     feature_lens = supervisions["num_frames"].to(device)
 
+    # Mean-normalise after both feature paths have converged on (N, T, C), so
+    # on-the-fly and precomputed training see identical inputs. Decoding and
+    # the demo must use the same --cmn or the mismatch is silent.
+    feature = apply_cmn(feature, params.cmn, feature_lens)
+
     with torch.set_grad_enabled(is_training):
         nnet_output, encoder_memory, memory_mask = model(
             feature, supervisions, warmup=warmup
@@ -578,7 +758,18 @@ def compute_loss(
             #
             # See https://github.com/k2-fsa/icefall/issues/97
             # for more details
-            unsorted_token_ids = graph_compiler.texts_to_ids(supervisions["text"])
+            if isinstance(graph_compiler, CtcTrainingGraphCompiler):
+                # texts_to_ids() on this compiler returns WORD ids (a
+                # different, larger vocabulary than the phone-sized
+                # decoder output layer) -- not usable here.
+                unsorted_token_ids = texts_to_phone_ids(
+                    supervisions["text"],
+                    graph_compiler.word2phones,
+                    graph_compiler.token_table,
+                    graph_compiler.oov_phones,
+                )
+            else:
+                unsorted_token_ids = graph_compiler.texts_to_ids(supervisions["text"])
             att_loss = mmodel.decoder_forward(
                 encoder_memory,
                 memory_mask,
@@ -592,6 +783,74 @@ def compute_loss(
         loss = ctc_loss
         att_loss = torch.tensor([0])
 
+    if _SPK_ADV is not None and params.speaker_adv_weight > 0.0:
+        with torch.set_grad_enabled(is_training):
+            # encoder_memory is (T, N, C) in batch order (encode_supervisions
+            # sorts only its own segments), so cuts line up with dim 1.
+            mem = encoder_memory.permute(1, 0, 2)                  # (N, T, C)
+            mask = (
+                torch.arange(mem.size(1), device=mem.device)[None, :]
+                < feature_lens[:, None]
+            ).unsqueeze(-1).to(mem.dtype)
+            pooled = (mem * mask).sum(1) / mask.sum(1).clamp(min=1.0)  # (N, C)
+            spk = torch.tensor(
+                [_SPK_IDS.get(c.id.split("_")[0], 0) for c in supervisions["cut"]],
+                dtype=torch.long, device=mem.device,
+            )
+            spk_logits = _SPK_ADV(pooled, params.speaker_adv_weight)
+            speaker_loss = nn.functional.cross_entropy(spk_logits, spk)
+            with torch.no_grad():
+                spk_acc = (spk_logits.argmax(-1) == spk).float().mean()
+        # Added, not subtracted: the classifier minimises this while the
+        # reversal flips the sign of what reaches the encoder.
+        #
+        # Scaled to the recognition loss's reduction. k2.ctc_loss runs with
+        # reduction="sum" over every frame in the batch (~2e4 early in
+        # training), while cross_entropy returns a mean (~3.4). Adding them
+        # directly made the adversarial gradient reaching the encoder ~4
+        # orders of magnitude smaller than --speaker-adv-weight implied, so
+        # every arm before 2026-09-01 trained an effectively inert branch and
+        # its null result measured nothing. lambda stays inside the GRL, where
+        # it scales only what reaches the encoder; this factor just puts the
+        # two terms on a common scale. Adam-family updates are ~invariant to a
+        # constant loss scale, so the classifier head is unaffected.
+        loss = loss + speaker_loss * feature_lens.sum()
+    else:
+        speaker_loss = torch.tensor([0])
+        spk_acc = torch.tensor([0])
+
+    if params.phoneme_ctc_weight > 0.0:
+        with torch.set_grad_enabled(is_training):
+            mmodel = model.module if hasattr(model, "module") else model
+            # Same unsorted order as the attention decoder above: encoder_memory
+            # isn't sorted by encode_supervisions(), so index off
+            # supervisions["text"]/["num_frames"] directly, not `texts`.
+            phoneme_log_probs = mmodel.phoneme_ctc_output(encoder_memory)  # (N, T, P)
+            phoneme_targets = [
+                torch.tensor(text_to_phoneme_ids(t), dtype=torch.long)
+                for t in supervisions["text"]
+            ]
+            target_lengths = torch.tensor(
+                [len(t) for t in phoneme_targets], dtype=torch.long
+            )
+            targets = torch.cat(phoneme_targets).to(device)
+            input_lengths = torch.div(
+                feature_lens.cpu(), params.subsampling_factor, rounding_mode="floor"
+            ).clamp(max=phoneme_log_probs.size(1))
+
+            phoneme_ctc_loss = nn.functional.ctc_loss(
+                log_probs=phoneme_log_probs.permute(1, 0, 2),  # (T, N, P)
+                targets=targets,
+                input_lengths=input_lengths,
+                target_lengths=target_lengths,
+                blank=0,
+                reduction=params.reduction,
+                zero_infinity=True,
+            )
+        loss = loss + params.phoneme_ctc_weight * phoneme_ctc_loss
+    else:
+        phoneme_ctc_loss = torch.tensor([0])
+
     assert loss.requires_grad == is_training
 
     info = MetricsTracker()
@@ -601,8 +860,17 @@ def compute_loss(
     info["ctc_loss"] = ctc_loss.detach().cpu().item()
     if params.att_rate != 0.0:
         info["att_loss"] = att_loss.detach().cpu().item()
+    if params.phoneme_ctc_weight > 0.0:
+        info["phoneme_ctc_loss"] = phoneme_ctc_loss.detach().cpu().item()
 
     # Note: We use reduction=sum while computing the loss.
+    if _SPK_ADV is not None and params.speaker_adv_weight > 0.0:
+        # MetricsTracker divides every value by the frame count, so store sums
+        # (icefall's convention) or these read as ~1e-4 instead of a CE and an
+        # accuracy.
+        _f = feature_lens.sum().item()
+        info["spk_loss"] = speaker_loss.detach().cpu().item() * _f
+        info["spk_acc"] = spk_acc.detach().cpu().item() * _f
     info["loss"] = loss.detach().cpu().item()
 
     # `utt_duration` and `utt_pad_proportion` would be normalized by `utterances`  # noqa
@@ -830,6 +1098,50 @@ def train_one_epoch(
         params.best_train_loss = params.train_loss
 
 
+def read_word_to_phones(lang_dir) -> Dict[str, List[str]]:
+    """Parse lang_dir/lexicon.txt ("word phone1 phone2 ...", one
+    pronunciation per line) into a word -> phone-list dict. Used for the
+    attention decoder's phone-ID targets; the compiled L.pt/HLG.pt don't
+    expose this mapping directly, so it's simplest to just read the plain
+    text lexicon icefall already ships in every lang dir."""
+    word2phones = {}
+    with open(Path(lang_dir) / "lexicon.txt") as f:
+        for line in f:
+            parts = line.split()
+            if not parts:
+                continue
+            word2phones[parts[0]] = parts[1:]
+    return word2phones
+
+
+def texts_to_phone_ids(
+    texts: List[str],
+    word2phones: Dict[str, List[str]],
+    token_table,
+    oov_phones: List[str],
+) -> List[List[int]]:
+    """Attention-decoder target IDs for a phone-based lang dir: each
+    utterance's words are looked up in word2phones and their phones
+    concatenated in order (no inter-word boundary marker -- unlike BPE's
+    '_' prefix, plain phones have no natural one, and the decoder here is
+    only ever an auxiliary training signal, never used standalone for
+    decoding, so losing word-boundary info in its target doesn't matter).
+    Does NOT add sos/eos -- decoder_forward() does that itself via
+    add_sos()/add_eos(), same contract as BpeCtcTrainingGraphCompiler's
+    texts_to_ids(). Words missing from the lexicon (e.g. "sp", the
+    short-pause marker, which isn't a lexicon entry) fall back to
+    oov_phones, mirroring how CtcTrainingGraphCompiler already treats
+    unknown words as <UNK> for the main CTC loss."""
+    out = []
+    for text in texts:
+        ids = []
+        for word in text.split():
+            phones = word2phones.get(word, oov_phones)
+            ids.extend(token_table[p] for p in phones)
+        out.append(ids)
+    return out
+
+
 def run(rank, world_size, args):
     """
     Args:
@@ -844,6 +1156,10 @@ def run(rank, world_size, args):
     """
     params = get_params()
     params.update(vars(args))
+    params.dropout_points = parse_dropout_schedule(params.dropout_schedule)
+    if params.dropout_points:
+        logging.info(f"Dropout schedule active: {params.dropout_points} "
+                     f"(overrides the fixed --dropout {params.dropout})")
 
     fix_random_seed(params.seed)
     if world_size > 1:
@@ -874,25 +1190,31 @@ def run(rank, world_size, args):
             eos_token="<sos/eos>",
         )
     elif "lang_phone" in str(params.lang_dir):
-        assert params.att_rate == 0, (
-            "Attention decoder training does not support phone lang dirs "
-            "at this time due to a missing <sos/eos> symbol. Set --att-rate=0 "
-            "for pure CTC training when using a phone-based lang dir."
-        )
-        assert params.num_decoder_layers == 0, (
-            "Attention decoder training does not support phone lang dirs "
-            "at this time due to a missing <sos/eos> symbol. "
-            "Set --num-decoder-layers=0 for pure CTC training when using "
-            "a phone-based lang dir."
-        )
         graph_compiler = CtcTrainingGraphCompiler(
             lexicon,
             device=device,
         )
-        # Manually add the sos/eos ID with their default values
-        # from the BPE recipe which we're adapting here.
-        graph_compiler.sos_id = 1
-        graph_compiler.eos_id = 1
+        if params.att_rate != 0.0 or params.num_decoder_layers > 0:
+            # <sos/eos> isn't a real phone: give it the next free class
+            # instead of reusing a real phone's ID for it (the ID 1
+            # placeholder used when the decoder was unsupported was SIL's
+            # ID -- harmless only because nothing ever trained on it;
+            # conflating "silence" with "sentence boundary" would be
+            # wrong once the decoder actually uses it).
+            graph_compiler.sos_id = graph_compiler.eos_id = num_classes
+            num_classes += 1
+            # word -> phone-ID targets for the attention decoder. CTC
+            # training/decoding (HLG) is untouched by this: it only ever
+            # emits/expects ids 0..max_token_id, this new class is purely
+            # additive and the CTC loss never asks for it.
+            graph_compiler.word2phones = read_word_to_phones(params.lang_dir)
+            graph_compiler.oov_phones = graph_compiler.word2phones["<UNK>"]
+            graph_compiler.token_table = lexicon.token_table
+        else:
+            # Pure CTC: the decoder never runs, so this placeholder value
+            # is never read by any loss.
+            graph_compiler.sos_id = 1
+            graph_compiler.eos_id = 1
     else:
         raise ValueError(
             f"Unsupported type of lang dir (we expected it to have "
@@ -908,9 +1230,16 @@ def run(rank, world_size, args):
         subsampling_factor=params.subsampling_factor,
         num_encoder_layers=params.num_encoder_layers,
         num_decoder_layers=params.num_decoder_layers,
-        dropout=0.1,
-        layer_dropout=0.1,
+        dropout=params.dropout,
+        layer_dropout=(
+            params.layer_dropout
+            if params.layer_dropout is not None
+            else params.dropout
+        ),
         dim_feedforward=1024,
+        num_phoneme_classes=(
+            NUM_PHONEME_CLASSES if params.phoneme_ctc_weight > 0 else None
+        ),
     )
 
     print(model)
@@ -949,7 +1278,28 @@ def run(rank, world_size, args):
 
         avmodel = load_globals_avbubert(args)["model"].to(device)
 
-    optimizer = Eve(model.parameters(), lr=params.initial_lr)
+    trainable = list(model.parameters())
+    if params.speaker_adv_weight > 0.0:
+        global _SPK_ADV, _SPK_IDS
+        # Read the manifest directly: the datamodule object is not built until
+        # later in run(), and only the cut ids are needed here.
+        from lhotse import load_manifest_lazy
+        spk_names = sorted({
+            c.id.split("_")[0]
+            for c in load_manifest_lazy(
+                Path(params.manifest_dir) / "grid_cuts_train.jsonl.gz")
+        })
+        _SPK_IDS = {s_: i for i, s_ in enumerate(spk_names)}
+        _SPK_ADV = SpeakerAdversary(
+            params.encoder_dim, len(spk_names), params.speaker_adv_hidden
+        ).to(device)
+        trainable += list(_SPK_ADV.parameters())
+        logging.info(
+            f"Speaker-adversarial branch on: {len(spk_names)} speakers, "
+            f"lambda={params.speaker_adv_weight}, hidden={params.speaker_adv_hidden}"
+        )
+
+    optimizer = Eve(trainable, lr=params.initial_lr)
 
     scheduler = Eden(optimizer, params.lr_batches, params.lr_epochs)
 
@@ -1013,6 +1363,18 @@ def run(rank, world_size, args):
             tb_writer.add_scalar("train/epoch", epoch, params.batch_idx_train)
 
         params.cur_epoch = epoch
+
+        if getattr(params, "dropout_points", None):
+            # Fraction of training completed at the *start* of this epoch.
+            frac = (epoch - 1) / max(params.num_epochs, 1)
+            p_now = dropout_at(params.dropout_points, frac)
+            n_mod = set_dropout(model, p_now)
+            logging.info(
+                f"Epoch {epoch}: dropout set to {p_now:.3f} on {n_mod} modules "
+                f"(schedule {params.dropout_schedule}, frac {frac:.2f})"
+            )
+            if tb_writer is not None:
+                tb_writer.add_scalar("train/dropout", p_now, params.batch_idx_train)
 
         train_one_epoch(
             params=params,
