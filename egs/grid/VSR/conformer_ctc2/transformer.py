@@ -49,6 +49,7 @@ class Transformer(nn.Module):
         num_decoder_layers: int = 6,
         dropout: float = 0.1,
         layer_dropout: float = 0.075,
+        num_phoneme_classes: Optional[int] = None,
     ) -> None:
         """
         Args:
@@ -73,6 +74,12 @@ class Transformer(nn.Module):
           dropout:
             Dropout in encoder/decoder.
           layer_dropout (float): layer-dropout rate.
+          num_phoneme_classes:
+            If set, adds a second CTC head (trained separately from the
+            main one, see `phoneme_ctc_output`) predicting this many
+            phoneme classes from the same shared encoder output. None
+            (the default) omits the head entirely, so existing checkpoints
+            and callers are unaffected.
         """
         super().__init__()
 
@@ -108,6 +115,13 @@ class Transformer(nn.Module):
         self.encoder_output_layer = nn.Sequential(
             nn.Dropout(p=dropout), ScaledLinear(d_model, num_classes, bias=True)
         )
+
+        self.phoneme_output_layer = None
+        if num_phoneme_classes is not None:
+            self.phoneme_output_layer = nn.Sequential(
+                nn.Dropout(p=dropout),
+                ScaledLinear(d_model, num_phoneme_classes, bias=True),
+            )
 
         if num_decoder_layers > 0:
             self.decoder_num_class = (
@@ -225,6 +239,27 @@ class Transformer(nn.Module):
         x = self.encoder_output_layer(x)
         x = x.permute(1, 0, 2)  # (T, N, C) ->(N, T, C)
         x = nn.functional.log_softmax(x, dim=-1)  # (N, T, C)
+        return x
+
+    def phoneme_ctc_output(self, x: torch.Tensor) -> torch.Tensor:
+        """Same as `ctc_output`, but through the auxiliary phoneme head.
+        Only valid when the model was built with num_phoneme_classes set.
+
+        Args:
+          x:
+            The output tensor from the transformer encoder.
+            Its shape is (T, N, C)
+
+        Returns:
+          Log-probabilities over phoneme classes, shape (N, T, P).
+        """
+        assert self.phoneme_output_layer is not None, (
+            "phoneme_ctc_output() called but the model was built without "
+            "num_phoneme_classes"
+        )
+        x = self.phoneme_output_layer(x)
+        x = x.permute(1, 0, 2)  # (T, N, P) -> (N, T, P)
+        x = nn.functional.log_softmax(x, dim=-1)  # (N, T, P)
         return x
 
     @torch.jit.export

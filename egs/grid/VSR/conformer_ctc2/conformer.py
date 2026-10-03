@@ -81,6 +81,7 @@ class Conformer(Transformer):
         dropout: float = 0.1,
         layer_dropout: float = 0.075,
         cnn_module_kernel: int = 31,
+        num_phoneme_classes: Optional[int] = None,
     ) -> None:
         super(Conformer, self).__init__(
             num_features=num_features,
@@ -93,6 +94,7 @@ class Conformer(Transformer):
             num_decoder_layers=num_decoder_layers,
             dropout=dropout,
             layer_dropout=layer_dropout,
+            num_phoneme_classes=num_phoneme_classes,
         )
 
         self.num_features = num_features
