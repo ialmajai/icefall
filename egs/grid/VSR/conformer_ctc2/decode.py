@@ -30,8 +30,10 @@ import torch
 import torch.nn as nn
 from asr_datamodule import GridAsrDataModule
 from conformer import Conformer
+from cmn import apply_cmn
 
 from icefall.bpe_graph_compiler import BpeCtcTrainingGraphCompiler
+from icefall.graph_compiler import CtcTrainingGraphCompiler
 from icefall.checkpoint import (
     average_checkpoints,
     average_checkpoints_with_averaged_model,
@@ -98,6 +100,23 @@ def get_parser():
         help="Number of checkpoints to average. Automatically select "
         "consecutive checkpoints before the checkpoint specified by "
         "'--epoch' and '--iter'",
+    )
+
+    parser.add_argument(
+        "--encoder-dim",
+        type=int,
+        default=128,
+        help="""Conformer attention dim; must match the checkpoint's
+        training value. Default: %(default)s""",
+    )
+
+    parser.add_argument(
+        "--cmn",
+        choices=["none", "utt"],
+        default="none",
+        help="""Cepstral mean normalisation of the features. Must match the
+        value the checkpoint was trained with (train.py --cmn); a mismatch
+        degrades accuracy silently. Default: %(default)s""",
     )
 
     parser.add_argument(
@@ -263,7 +282,6 @@ def get_params() -> AttributeDict:
             "feature_dim": 768,
             "nhead": 8,
             "dim_feedforward": 1024,
-            "encoder_dim": 128,
             "num_encoder_layers": 6,
             # parameters for decoding
             "search_beam": 20,
@@ -391,6 +409,10 @@ def decode_one_batch(
     # at entry, feature is (N, T, C)
 
     supervisions = batch["supervisions"]
+
+    # Must match the --cmn the checkpoint was trained with.
+    feature = apply_cmn(feature, params.cmn,
+                        supervisions["num_frames"].to(device))
 
     nnet_output, memory, memory_key_padding_mask = model(feature, supervisions)
     # nnet_output is (N, T, C)
@@ -771,18 +793,40 @@ def main():
     max_token_id = max(lexicon.tokens)
     num_classes = max_token_id + 1  # +1 for the blank
 
+    # Mirror train.py: with a phone lexicon, <sos/eos> is not a real phone and
+    # was given the next free class at training time, so the trained model has
+    # one more output than the lexicon implies (37 phones -> 38 classes). The
+    # BPE inventory already contains <sos/eos>, so it needs no adjustment.
+    if "lang_bpe" not in str(params.lang_dir) and params.num_decoder_layers > 0:
+        num_classes += 1
+
     device = torch.device("cpu")
     if torch.cuda.is_available():
         device = torch.device("cuda", 0)
 
     logging.info(f"device: {device}")
 
-    graph_compiler = BpeCtcTrainingGraphCompiler(
-        params.lang_dir,
-        device=device,
-        sos_token="<sos/eos>",
-        eos_token="<sos/eos>",
-    )
+    # train.py branches on the lexicon type; decode.py did not, so a phone
+    # lang_dir sent it looking for a non-existent bpe.model.
+    if "lang_bpe" in str(params.lang_dir):
+        graph_compiler = BpeCtcTrainingGraphCompiler(
+            params.lang_dir,
+            device=device,
+            sos_token="<sos/eos>",
+            eos_token="<sos/eos>",
+        )
+    else:
+        lexicon_ph = Lexicon(params.lang_dir)
+        graph_compiler = CtcTrainingGraphCompiler(
+            lexicon_ph,
+            device=device,
+        )
+        # Mirror train.py: <sos/eos> is not a real phone, so it was given the
+        # next free class at training time. The compiler does not set these
+        # itself, and decode.py reads them.
+        graph_compiler.sos_id = graph_compiler.eos_id = (
+            max(lexicon_ph.tokens) + 1
+        )
     sos_id = graph_compiler.sos_id
     eos_id = graph_compiler.eos_id
 
