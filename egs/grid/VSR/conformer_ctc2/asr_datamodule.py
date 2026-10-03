@@ -137,6 +137,17 @@ class GridAsrDataModule:
             "noise augmentation is used.",
         )
         group.add_argument(
+            "--roi-mode",
+            choices=["centroid", "meanface"],
+            default="centroid",
+            help="""Which cached mouth ROIs the on-the-fly path reads.
+            'centroid': <clip>.mouth_frames.npz (already transform()ed floats).
+            'meanface': <clip>.mfroi.npz (raw uint8 mean-face-aligned ROIs, so
+            the AV-HuBERT normalisation is applied here). Must match the
+            geometry the features/checkpoint correspond to.""",
+        )
+
+        group.add_argument(
             "--on-the-fly-feats",
             type=str2bool,
             default=True,
@@ -274,6 +285,7 @@ class GridAsrDataModule:
             input_strategy = VisualFeatureInputStrategy(
                 mode=VisualInputMode.ON_THE_FLY,
                 augment=augment,
+                roi_mode=self.args.roi_mode,
             )
         else:
             input_strategy = VisualFeatureInputStrategy()
@@ -760,22 +772,37 @@ class VisualFeatureInputStrategy(BatchIO):
         frame_shift: float = 0.04,
         mode: str = VisualInputMode.PRECOMPUTED,
         augment=None,
+        roi_mode: str = "centroid",
     ):
         super().__init__()
         self.frame_shift = frame_shift
         self.mode = mode
         self.augment = augment
+        self.roi_mode = roi_mode
 
     def _load_precomputed_features(self, cut):
         return torch.from_numpy(
             cut.load_custom("video_features")
         ).float()
 
+    # AV-HuBERT's own image normalisation (avhubert.utils.Compose of
+    # Normalize(0,255) then Normalize(image_mean, image_std)); the constants
+    # come from the pretrained task config. Reproduced here so the mean-face
+    # path does not have to load the 100M-parameter model just to normalise.
+    _IMAGE_MEAN = 0.421
+    _IMAGE_STD = 0.165
+
     def _load_mouth_frames(self, cut):
         video_path = Path(cut.recording.sources[0].source)
-        roi_file = video_path.with_suffix(".mouth_frames.npz")
 
-        frames = np.load(roi_file)["frames"]  # (T,H,W)
+        if self.roi_mode == "meanface":
+            # Mean-face ROIs are cached raw (uint8), unlike .mouth_frames.npz
+            # which already holds transform()ed floats -- so normalise here,
+            # otherwise the encoder sees 0..255 inputs and silently degrades.
+            roi = np.load(video_path.with_suffix(".mfroi.npz"))["roi"]
+            frames = (roi.astype(np.float32) / 255.0 - self._IMAGE_MEAN) / self._IMAGE_STD
+        else:
+            frames = np.load(video_path.with_suffix(".mouth_frames.npz"))["frames"]
 
         frames = torch.FloatTensor(frames)
         
@@ -783,16 +810,23 @@ class VisualFeatureInputStrategy(BatchIO):
 
 
         if self.augment is not None:
-            landmark_path = video_path.with_suffix(".landmarks.npz")
-            landmarks = np.load(landmark_path)["landmarks"]
-            
-            roi_landmarks = self.augment._landmarks_to_roi(
-                landmarks,
-                mouth_w   = 64,    # same values used during preprocessing
-                mouth_h   = 64,
-                roi_size  = (88, 88),
-            )
-                
+            if self.roi_mode == "meanface":
+                # _landmarks_to_roi assumes the centroid crop geometry, which
+                # does not hold after the mean-face warp. Landmarks are only
+                # consumed by the moustache occlusion (mustache_prob, default
+                # 0.0), so None is safe and every other augmentation applies
+                # unchanged. Revisit if mustache_prob is ever turned on.
+                roi_landmarks = None
+            else:
+                landmarks = np.load(
+                    video_path.with_suffix(".landmarks.npz"))["landmarks"]
+                roi_landmarks = self.augment._landmarks_to_roi(
+                    landmarks,
+                    mouth_w=64,    # same values used during preprocessing
+                    mouth_h=64,
+                    roi_size=(88, 88),
+                )
+
             frames = self.augment(frames, roi_landmarks)
 
         return frames
