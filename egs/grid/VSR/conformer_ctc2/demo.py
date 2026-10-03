@@ -51,6 +51,7 @@ import argparse
 import logging
 import math
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -70,6 +71,7 @@ except Exception:  # missing dir/deps: demo runs without the fallback
     _mediapipe = None
 
 from conformer import Conformer
+from cmn import apply_cmn
 from icefall.checkpoint import load_checkpoint
 from icefall.utils import str2bool
 
@@ -212,24 +214,6 @@ QUOTA_DAY_S = 24 * 3600
 
 _usage_log = {}  # ip -> submission timestamps within the last day
 
-# Duplicate guard: an identical video (by content hash) resubmitted by the
-# same visitor with identical noise/blur settings within this window is not
-# reprocessed; results would be the same. Local (operator) IPs are exempt.
-SEEN_WINDOW_S = 3600
-
-_seen_log = {}  # (ip, sig, noise, blur) -> time last processed
-
-
-def _seen_recently(ip: str, sig: str, noise: float, blur: float) -> bool:
-    now = time.time()
-    for k, t in list(_seen_log.items()):  # opportunistic pruning
-        if now - t >= SEEN_WINDOW_S:
-            del _seen_log[k]
-    return (ip, sig, noise, blur) in _seen_log
-
-
-def _mark_seen(ip: str, sig: str, noise: float, blur: float) -> None:
-    _seen_log[(ip, sig, noise, blur)] = time.time()
 
 
 def _client_ip(request) -> str:
@@ -362,17 +346,59 @@ MAX_ACTIVE_STATES = 10000
 # for the decoding lattice) on a held-out unseen-speaker sweep.
 CONF_OUTPUT_BEAM = 10
 CONF_TEMPERATURE = 2.0
-# Out-of-domain detection (1best only): mean non-blank emission log-prob per
-# frame of the best path, i.e. how well the lip frames match the decoded GRID
-# sentence. In-domain GRID speech sits near 0 (~-0.03, worst ~-0.17); non-GRID
-# motion drops well below. Two tiers:
-#   below WARN  -> soft warning, still show the closest-guess result;
-#   below HIDE  -> definitely not a GRID sentence, show nothing (HIDE is well
-#                  below any in-domain score, so an in-domain clip is never
-#                  blanked).
-# TODO: refine both on real non-GRID recordings ([[grid-demo-ood-calibration]]).
-OOD_WARN_THRESHOLD = -0.20
+# Out-of-domain detection (1best only), two independent signals; either
+# firing hides the result. Calibrated on 15 real in-domain clips (plain +
+# Lombard GRID, several speakers, some with genuine recognition errors) and
+# 3 real non-GRID clips -- small samples, especially on the OOD side, so
+# treat both thresholds as provisional.
+# TODO: refine on more real non-GRID recordings ([[grid-demo-ood-calibration]]).
+#
+# Signal 1: mean non-blank emission log-prob per frame of the best path,
+# i.e. how well the lip frames match the decoded GRID sentence. In-domain
+# GRID speech sits near 0 (~-0.03, worst ~-0.17); non-GRID motion CAN drop
+# well below, but doesn't always -- this signal alone missed 2 of 3 known
+# OOD clips (they scored -0.115 and -0.141, both better than the in-domain
+# worst case).
 OOD_HIDE_THRESHOLD = -0.50
+# Signal 2: std of the per-frame max-softmax (top-1 probability, taken
+# straight off nnet_output -- decode-independent, unlike signal 1) over
+# non-blank frames. Genuine GRID speech gives temporally stable per-frame
+# confidence even when the model picks the wrong word; unfamiliar mouth
+# motion makes it swing frame to frame.
+#
+# This signal reads off the output distribution, so it does NOT transfer
+# across models with different vocabularies. Under the BPE-58 system: 15
+# in-domain clips 0.004-0.142, 3 OOD clips 0.157-0.208, threshold 0.15 at
+# the midpoint. Under the phone system the in-domain distribution sits
+# higher -- 200 GRID test clips give mean 0.089, p99 0.161, max 0.177 --
+# and 0.15 would hide 4% of legitimate results.
+#
+# Retuned from the in-domain distribution alone (200 clips, versus 15
+# before), placed above the observed maximum so that correct results are
+# not hidden. The tradeoff is deliberate: on a public demo, hiding a good
+# result is worse than showing a weak one, and signal 1 plus the displayed
+# per-word confidences still cover genuinely unfamiliar input.
+# UNVERIFIED: OOD recall at this threshold has not been measured for the
+# phone model -- the 3 non-GRID clips behind the old figure were not
+# re-scored. Treat as provisional ([[grid-demo-ood-calibration]]).
+OOD_STD_THRESHOLD = 0.20
+
+# Post-hoc word-confidence recalibration (1best only): the raw score from
+# _word_posteriors/_word_confidences_1best is well-calibrated at the very
+# top of its range but overconfident by 9-22 points through 0.4-0.9 (see
+# [[confidence-calibration]] -- AUC-tuned, never checked for calibration
+# until now). Isotonic regression fit on GRID test clips, held out at the
+# clip level; cut ECE 0.041 -> 0.024 on clips never used to fit it.
+# conformer_ctc2/_confidence_recalibrate.py regenerates this file.
+#
+# The map is fitted to one model's score distribution and is NOT portable
+# across models: pairing a calibration with a different checkpoint silently
+# reports wrong confidences. Override with --word-conf-calibration when
+# serving anything other than the BPE-58 system this default was fitted on
+# (the phone system uses word_conf_isotonic_calibration_phone_l8.npz).
+WORD_CONF_CALIBRATION_PATH = (
+    Path(__file__).resolve().parent / "word_conf_isotonic_calibration.npz"
+)
 
 
 def load_tokens(path: Path):
@@ -461,6 +487,18 @@ class LipReader:
         self.device = g["device"]
         self.layer = args.layer
         self.normalize_head = args.normalize_head
+        # Mouth-ROI geometry. "meanface" aligns every frame to a reference face
+        # before cropping (see local/meanface_roi.py) and must match whatever
+        # the loaded checkpoint was trained on -- a model trained on one
+        # geometry decodes the other poorly.
+        # Feature mean normalisation; must match the checkpoint's training.
+        self.cmn = getattr(args, "cmn", "none")
+        self.roi_mode = getattr(args, "roi_mode", "centroid")
+        self.mean_face = None
+        if self.roi_mode == "meanface":
+            from meanface_roi import load_mean_face  # local/ is on sys.path
+            self.mean_face = load_mean_face(args.mean_face)
+            logging.info(f"Mouth ROI: mean-face aligned (from {args.mean_face})")
 
         self.id2sym, num_classes = load_tokens(args.tokens)
 
@@ -481,6 +519,23 @@ class LipReader:
             f"(num_classes={num_classes}, layer={self.layer})"
         )
 
+        # Optional word-confidence recalibration (see
+        # WORD_CONF_CALIBRATION_PATH above). Missing/broken file degrades
+        # to raw (uncalibrated) scores, never a crash.
+        self._word_conf_calib = None
+        calib_path = getattr(args, "word_conf_calibration", None) \
+            or WORD_CONF_CALIBRATION_PATH
+        try:
+            data = np.load(calib_path)
+            self._word_conf_calib = (data["x_sorted"], data["fitted_y"])
+            logging.info(
+                f"Loaded word-confidence calibration from {calib_path}"
+            )
+        except Exception:
+            logging.exception(
+                "Word-confidence calibration unavailable; using raw scores"
+            )
+
         # Optional lexicon-constrained decoding graph (HLG).
         self.method = args.method
         self.HLG = None
@@ -499,6 +554,63 @@ class LipReader:
             logging.info(
                 f"Loaded HLG from {args.HLG} and words from {args.words_file}"
             )
+
+        # Idle GPU offload: on a rarely-used public demo, keeping the models
+        # resident wastes GPU memory that other jobs on this box could use.
+        # After `idle_offload_seconds` with no request, move the three
+        # GPU-resident objects (AV-HuBERT, Conformer, HLG) to CPU and free the
+        # CUDA cache; the next request moves them back (<1 s). A single lock
+        # serialises this against inference (gradio already runs one GPU job at
+        # a time), so a request can never see a half-migrated model. Disabled
+        # (`<= 0`) or when there is no CUDA device, this is a no-op.
+        self._gpu_device = self.device
+        self._cpu_device = torch.device("cpu")
+        self._device_lock = threading.RLock()
+        self._offloaded = False
+        self._last_active = time.monotonic()
+        self._offload_seconds = getattr(args, "idle_offload_seconds", 0)
+        if self._offload_seconds > 0 and self._gpu_device.type == "cuda":
+            t = threading.Thread(target=self._idle_offload_loop, daemon=True)
+            t.start()
+            logging.info(
+                f"Idle GPU offload enabled: models move to CPU after "
+                f"{self._offload_seconds}s idle"
+            )
+
+    def _move_models(self, device: torch.device) -> None:
+        """Move the GPU-resident objects to `device`. Caller holds the lock."""
+        self.avhubert.to(device)
+        self.model.to(device)
+        if self.HLG is not None:
+            self.HLG = self.HLG.to(device)
+        self.device = device
+
+    def _activate(self) -> None:
+        """Ensure the models are on the GPU before an inference. Caller holds
+        the lock. Also stamps activity so the idle timer restarts."""
+        if self._offloaded:
+            logging.info("Request arrived; restoring models to GPU")
+            self._move_models(self._gpu_device)
+            self._offloaded = False
+        self._last_active = time.monotonic()
+
+    def _idle_offload_loop(self) -> None:
+        """Background daemon: offload the models to CPU once the demo has been
+        idle for `_offload_seconds`. Re-checks under the lock so it never
+        offloads a model that a request just reactivated."""
+        while True:
+            time.sleep(min(30, self._offload_seconds))
+            with self._device_lock:
+                if self._offloaded:
+                    continue
+                idle = time.monotonic() - self._last_active
+                if idle >= self._offload_seconds:
+                    logging.info(
+                        f"Idle for {idle:.0f}s; offloading models to CPU"
+                    )
+                    self._move_models(self._cpu_device)
+                    self._offloaded = True
+                    torch.cuda.empty_cache()
 
     def _roi_and_features(self, video: str, noise_sigma: float = 0.0,
                           blur_sigma: float = 0.0):
@@ -543,15 +655,21 @@ class LipReader:
                 "no face was detected in the clip. Please use a frontal "
                 "talking-face video with the whole face visible."
             )
+        if self.roi_mode == "meanface":
+            # Pose normalization, not just scale: every frame is warped onto a
+            # reference face (similarity fit on eye corners + nose tip) before
+            # the mouth crop, which is what AV-HuBERT itself was pretrained on.
+            from meanface_roi import extract_meanface_frames
+            roi = extract_meanface_frames(video_path, landmarks, self.mean_face)
+            if roi.shape[0] == 0:
+                raise RuntimeError(
+                    "the mouth region could not be aligned in this clip. "
+                    "Please use a frontal talking-face video."
+                )
+            return self._features_from_roi(roi, noise_sigma, blur_sigma)
         # Head-size normalization: scale the mouth crop to the detected face
         # size (via IOD) so the mouth-to-head ratio matches GRID regardless of
         # how big the face is in the frame. On GRID this yields ~64px (no-op).
-        #
-        # TODO: normalize head *pose*, not just scale -- align each frame to a
-        # reference/mean face via a similarity transform on stable landmarks
-        # (eyes/nose), as in AV-HuBERT's align_mouth. This would correct
-        # in-plane rotation and non-frontal pose before cropping, instead of the
-        # current scale-only, per-video-median-IOD approximation.
         if self.normalize_head:
             crop = max(16, round(CROP_PER_IOD * _median_iod(landmarks)))
             logging.info(f"Head-normalized mouth crop: {crop}px "
@@ -561,7 +679,12 @@ class LipReader:
         raw = _extract_mouth_frames(
             video_path, landmarks, crop, crop, ROI_SIZE, MOUTH_LEFT, MOUTH_RIGHT
         )
-        roi = np.stack(raw)  # (T, 88, 88) uint8
+        return self._features_from_roi(np.stack(raw), noise_sigma, blur_sigma)
+
+    def _features_from_roi(self, roi: np.ndarray, noise_sigma: float = 0.0,
+                           blur_sigma: float = 0.0):
+        """Shared tail of both ROI geometries: optional degradation, then
+        AV-HuBERT. Returns (T,88,88) uint8 ROI and (T,768) features."""
         if noise_sigma or blur_sigma:  # robustness playground
             roi = _degrade_roi(roi, noise_sigma, blur_sigma)
         frames = self.transform(roi)  # normalized float (T, 88, 88)
@@ -597,14 +720,37 @@ class LipReader:
             word_confs = self._word_confidences_1best(
                 best_path, nnet_output, words
             )
+        word_confs = self._calibrate_word_confs(word_confs)
         try:
             _, emit_nb = self._emission_score(best_path, nnet_output)
-            ood = ("hide" if emit_nb < OOD_HIDE_THRESHOLD
-                   else "warn" if emit_nb < OOD_WARN_THRESHOLD else "")
+            low_emission = emit_nb < OOD_HIDE_THRESHOLD
         except Exception:
             logging.exception("OOD emission score failed")
-            ood = ""
+            low_emission = False
+        try:
+            nb_std = self._confidence_stability(nnet_output)
+            unstable_confidence = nb_std > OOD_STD_THRESHOLD
+        except Exception:
+            logging.exception("OOD confidence-stability score failed")
+            unstable_confidence = False
+        ood = "hide" if (low_emission or unstable_confidence) else ""
         return " ".join(words), word_confs, ood
+
+    def _calibrate_word_confs(self, word_confs):
+        """Map raw word-confidence scores through the fitted isotonic
+        calibration (WORD_CONF_CALIBRATION_PATH), if one loaded; a no-op
+        otherwise. Only meaningful for scores from _word_posteriors /
+        _word_confidences_1best -- the calibration was fit on those, not
+        on ctc_greedy_decode's differently-computed scores."""
+        if self._word_conf_calib is None:
+            return word_confs
+        x_sorted, fitted_y = self._word_conf_calib
+        calibrated = []
+        for w, c in word_confs:
+            idx = np.searchsorted(x_sorted, c, side="right") - 1
+            idx = int(np.clip(idx, 0, len(fitted_y) - 1))
+            calibrated.append((w, float(fitted_y[idx])))
+        return calibrated
 
     def _emission_score(self, best_path, nnet_output):
         """Out-of-domain signal: how well the observed lip frames match the
@@ -626,6 +772,23 @@ class LipReader:
         mean_nb = (sum(nonblank) / len(nonblank) if nonblank
                    else float("-inf"))
         return mean_all, mean_nb
+
+    def _confidence_stability(self, nnet_output: torch.Tensor) -> float:
+        """Second, independent out-of-domain signal: std of the per-frame
+        max-softmax (top-1 probability at each frame) over non-blank
+        frames. Unlike `_emission_score`, this reads nnet_output directly
+        and doesn't depend on which token the HLG grammar forced onto each
+        frame. Genuine GRID speech keeps this low even when the decoded
+        word is wrong (stable confidence, wrong content); unfamiliar mouth
+        motion makes per-frame confidence swing, raising it. Higher ->
+        more likely out-of-domain."""
+        lp = nnet_output[0].cpu()  # (T, C) log-probs
+        max_lp, ids = lp.max(dim=-1)
+        nonblank = ids != BLANK_ID
+        p_max_nb = max_lp[nonblank].exp()
+        if p_max_nb.numel() < 2:
+            return 0.0
+        return p_max_nb.std().item()
 
     def _build_lattice(self, nnet_output: torch.Tensor, output_beam: int):
         from icefall.decode import get_lattice
@@ -736,14 +899,28 @@ class LipReader:
         err = _duration_error(video, MAX_DURATION_WEBCAM_S)
         if err:
             raise ValueError(err)
-        roi, feats = self._roi_and_features(video, noise_sigma, blur_sigma)
-        feature = feats.unsqueeze(0).to(self.device)  # (1, T, 768)
-        nnet_output = self.model(feature, None)[0]  # (1, T, C)
-        if self.method == "1best":
-            text, word_confs, ood = self._decode_1best(nnet_output)
-        else:
-            text, word_confs = ctc_greedy_decode(nnet_output.cpu(), self.id2sym)
-            ood = None
+        # Hold the device lock across the whole inference so the idle monitor
+        # cannot offload the models mid-request; `_activate` restores them to
+        # the GPU first if they were offloaded, and refreshes the idle timer.
+        with self._device_lock:
+            self._activate()
+            try:
+                roi, feats = self._roi_and_features(video, noise_sigma, blur_sigma)
+                feature = feats.unsqueeze(0).to(self.device)  # (1, T, 768)
+                # Must match the --cmn the checkpoint was trained with.
+                feature = apply_cmn(feature, self.cmn)
+                nnet_output = self.model(feature, None)[0]  # (1, T, C)
+                if self.method == "1best":
+                    text, word_confs, ood = self._decode_1best(nnet_output)
+                else:
+                    text, word_confs = ctc_greedy_decode(
+                        nnet_output.cpu(), self.id2sym
+                    )
+                    ood = None
+            finally:
+                # Restart the idle countdown from when the request finished,
+                # not when it started (long clips shouldn't shorten it).
+                self._last_active = time.monotonic()
         return text, roi, word_confs, ood
 
 
@@ -844,18 +1021,6 @@ _REQUEST_DIRS: list = []
 _MAX_REQUEST_DIRS = 4
 
 
-def _file_sig(path: str) -> str:
-    """MD5 of a file's content, used to recognize the bundled example clips
-    even after gradio copies them into its cache under a new path."""
-    import hashlib
-
-    h = hashlib.md5()
-    with open(path, "rb") as f:
-        for chunk in iter(lambda: f.read(1 << 20), b""):
-            h.update(chunk)
-    return h.hexdigest()
-
-
 def _new_request_dir() -> str:
     import shutil
     import tempfile
@@ -953,59 +1118,46 @@ def _frames_to_mp4(frames: np.ndarray, fps: int = 25, scale: int = 3, out_dir=No
 
 
 def launch_ui(reader: LipReader, example_paths=None,
-              hour_limit=5, day_limit=15, activity_log=None):
+              hour_limit=10, day_limit=30, activity_log=None):
     import gradio as gr
 
     def infer(video, source, noise, blur, request: gr.Request):
-        # Last two slots: Submit interactivity and the input video itself
-        # (cleared when the clip was the problem, kept otherwise).
+        # Last three slots: Submit interactivity, the input video itself
+        # (cleared when the clip was the problem, kept otherwise), and the
+        # inline status message shown under the video (empty = nothing to
+        # say). Messages are typed into status_msg, not popped as a corner
+        # toast, so they read as part of the video area.
         blank = ("", None, None, None)
         if not video:
-            return (*blank, gr.update(interactive=False), gr.update())
+            return (*blank, gr.update(interactive=False), gr.update(),
+                    gr.update())
         ip = _client_ip(request)
         local = _is_local_ip(ip)
-        sig = _file_sig(video)
-        if not local and _seen_recently(ip, sig, noise, blur):
-            gr.Warning(
-                "This video has already been processed in the last hour "
-                "with the same settings, so the result would be identical. "
-                "Change the noise/blur sliders or submit a different clip."
-            )
-            return (*blank, gr.update(interactive=False), gr.update())
         window = None if local else _quota_exceeded(ip, hour_limit, day_limit)
         if window == "hourly":
-            gr.Warning(
-                f"Hourly limit reached ({hour_limit} videos per visitor "
-                "per hour). Please try again in a little while."
-            )
             # Nothing wrong with the clip; keep it loaded.
-            return (*blank, gr.update(interactive=False), gr.update())
+            return (*blank, gr.update(interactive=False), gr.update(),
+                    f"Hourly limit reached ({hour_limit} videos per visitor "
+                    "per hour). Please try again in a little while.")
         if window == "daily":
-            gr.Warning(
-                f"Daily limit reached ({day_limit} videos per visitor "
-                "per day). Please try again tomorrow."
-            )
-            return (*blank, gr.update(interactive=False), gr.update())
+            return (*blank, gr.update(interactive=False), gr.update(),
+                    f"Daily limit reached ({day_limit} videos per visitor "
+                    "per day). Please try again tomorrow.")
         try:
             result = _infer(video, source, noise, blur)
-            if not local:
-                _mark_seen(ip, sig, noise, blur)
             return result
         except gr.Error as e:
-            # Surface the explanation as a toast WITHOUT raising: raising
-            # stamps a red "Error" badge on every output component. The
-            # faulty clip is cleared, returning the upload area to its
-            # normal empty state (the change handler then resets Submit).
-            gr.Warning(e.message)
-            return (*blank, gr.update(), None)
+            # Explain inline WITHOUT raising: raising stamps a red "Error"
+            # badge on every output component. The faulty clip is cleared,
+            # returning the upload area to its normal empty state (the
+            # change handler then resets Submit).
+            return (*blank, gr.update(), None, e.message)
         except Exception:
-            # Never let a bare, unexplained "Error" toast reach the user.
+            # Never let a bare, unexplained "Error" reach the user.
             logging.exception(f"Unexpected failure processing {video}")
-            gr.Warning(
-                "Processing failed unexpectedly; the problem has been "
-                "logged. Please try again with a different clip."
-            )
-            return (*blank, gr.update(), None)
+            return (*blank, gr.update(), None,
+                    "Processing failed unexpectedly; the problem has been "
+                    "logged. Please try again with a different clip.")
 
     def _infer(video, source, noise=0.0, blur=0.0):
         # Nothing of the user's is stored: the clip is recognized in memory
@@ -1024,19 +1176,12 @@ def launch_ui(reader: LipReader, example_paths=None,
         if ood == "hide":
             # Definitely not a GRID sentence: show nothing rather than a
             # misleading confident guess. Clip stays loaded, Submit off.
-            gr.Warning(
-                "This doesn't look like a GRID sentence, so there's nothing "
-                "to show. Please speak a sentence in the fixed "
-                "command·colour·preposition·letter·digit·adverb pattern."
-            )
             return ("", None, None, None,
-                    gr.update(interactive=False), gr.update())
-        if ood == "warn":
-            gr.Warning(
-                "This may not be a GRID sentence. The model only reads the "
-                "fixed command·colour·preposition·letter·digit·adverb "
-                "pattern, so the result below is just its closest guess."
-            )
+                    gr.update(interactive=False), gr.update(),
+                    "This doesn't look like a GRID sentence, so there's "
+                    "nothing to show. Please speak a sentence in the fixed "
+                    "command·colour·preposition·letter·digit·adverb "
+                    "pattern.")
         out_dir = _new_request_dir()
         return (
             text.title(),  # display: Title Case
@@ -1054,6 +1199,7 @@ def launch_ui(reader: LipReader, example_paths=None,
             # (re-enabled by video_in.change below). The clip stays loaded.
             gr.update(interactive=False),
             gr.update(),
+            "",  # clear any stale status message from a previous attempt
         )
 
     # Example clips: GRID .mpg won't play in the browser, so show a transcoded
@@ -1084,6 +1230,22 @@ def launch_ui(reader: LipReader, example_paths=None,
     /* Privacy note: accent-tinted so it reads as a reassurance, not fine print. */
     .privacy-note p { color: var(--color-accent); font-weight: 600;
         margin: 4px 0; }
+    /* Inline clip status/rejection message, overlaid as a banner on top of
+       the video area instead of a corner toast; empty when there is
+       nothing to say. #video-wrap is the positioning root (see the
+       gr.Group around video_in/status_msg); top, not bottom, so it never
+       covers the source-select / native video-player controls, which are
+       always at the bottom. */
+    #video-wrap { position: relative; }
+    /* top: 36px, not 0, so the banner clears the component's own header row
+       -- the label and, at its right, the clear (X) that returns the upload
+       area to the chooser. At 0 the banner covered the X, hiding the one
+       control that recovers from a rejected clip. */
+    .status-msg { position: absolute; left: 0; right: 0; top: 36px;
+        z-index: 20; pointer-events: none; }
+    .status-msg p { margin: 0; padding: 10px 14px;
+        background: rgba(0, 0, 0, 0.72); color: #fff; font-weight: 600;
+        text-align: center; border-radius: var(--radius-lg) var(--radius-lg) 0 0; }
     /* Hide the gradio footer (Built with Gradio / Use via API / Settings). */
     footer { display: none !important; }
     /* Hide the video trim (scissors) control on the input player. */
@@ -1170,16 +1332,45 @@ def launch_ui(reader: LipReader, example_paths=None,
     ) as demo:
         gr.Markdown("# Can AI Read Your Lips?")
         gr.Markdown(
-            "Live visual speech recognition constrained to the GRID corpus "
-            "grammar.",
+            "**Live visual speech recognition constrained to the GRID "
+            "corpus grammar.**",
             elem_classes=["subtitle"],
         )
         with gr.Row():
             with gr.Column():
-                video_in = gr.Video(
-                    label="Frontal talking-face clip", height=410,
-                    elem_id="video-input",
-                )
+                # elem_id="video-wrap" is the CSS positioning root for
+                # status_msg below, which overlays this group as a banner.
+                with gr.Group(elem_id="video-wrap"):
+                    video_in = gr.Video(
+                        # Viewport-relative cap so the player plus the
+                        # Submit button below it stay above the fold on a
+                        # phone; 410px on any window taller than ~910px.
+                        label="Frontal talking-face clip",
+                        height="min(410px, 45vh)",
+                        elem_id="video-input",
+                        sources=["webcam", "upload"],
+                    )
+                    # Rejection/status messages for this clip (bad duration,
+                    # unreadable file, quota, processing failure, OOD).
+                    # Overlaid on the video area itself (top banner) rather
+                    # than a corner toast or a line of text below it.
+                    status_msg = gr.Markdown("", elem_classes=["status-msg"])
+                # Directly under the upload/record controls so it is visible
+                # without scrolling on a phone, where the column stacks and
+                # everything below (examples, sliders) runs off-screen.
+                with gr.Row():
+                    # Enabled only while an unsubmitted clip is loaded: off at
+                    # start, on when the input changes, off again after infer.
+                    submit = gr.Button("Submit", variant="primary",
+                                       interactive=False)
+                    # Every finished submission -- result, out-of-domain, or
+                    # quota -- deliberately keeps the clip loaded with Submit
+                    # disabled, so without this the only way back to the
+                    # upload/record chooser is the video component's small
+                    # clear (X). Stays enabled after Submit goes dead; that
+                    # is the whole point of it.
+                    new_clip = gr.Button("Try another clip",
+                                         interactive=False)
                 # Grammar hint shown right under the upload area while it is
                 # empty (js populates it and hides it once a clip loads).
                 gr.HTML(
@@ -1205,7 +1396,8 @@ def launch_ui(reader: LipReader, example_paths=None,
                         examples=examples, inputs=[video_in],
                         label="Example clips from speakers unseen in "
                               "training: s1, s2, s20, s22 & one from "
-                              "Lombard Grid corpus (click, then Submit)",
+                              "Lombard Grid corpus & a live recording "
+                              "(click & submit)",
                     )
                 with gr.Accordion(
                     "Challenge the model: add noise or blur (optional)",
@@ -1222,11 +1414,10 @@ def launch_ui(reader: LipReader, example_paths=None,
                                          label="Noise (0 = none)")
                     blur_sl = gr.Slider(0, 5, value=0, step=0.25,
                                         label="Blur (0 = none)")
-                # Enabled only while an unsubmitted clip is loaded: off at
-                # start, on when the input changes, off again after infer.
-                submit = gr.Button("Submit", variant="primary",
-                                   interactive=False)
-            with gr.Column():
+            # elem_id: the results are scrolled into view after a successful
+            # recognition (see submit.click below), which matters on a phone
+            # where this column stacks below the whole input column.
+            with gr.Column(elem_id="results-col"):
                 with gr.Row():
                     roi_vid = gr.Video(
                         label="Mouth ROI (animated)",
@@ -1264,10 +1455,18 @@ def launch_ui(reader: LipReader, example_paths=None,
 
         def check_length(video, source):
             """Reject out-of-range clips as soon as they are supplied (by
-            upload or by webcam recording), before Submit: warn and clear
-            the input. recognize() re-checks as a backstop for the CLI/API
+            upload or by webcam recording), before Submit: clear the input
+            and explain why inline (status_msg, overlaid on the video area),
+            not as a corner toast. recognize() re-checks as a backstop for the CLI/API
             path. `source` selects the max-duration cap (webcam gets more)
-            and is recorded, so it is echoed into source_state."""
+            and is recorded, so it is echoed into source_state.
+
+            On the accept path, video_in gets gr.update() (a true no-op),
+            not the video it was passed: writing the same value back into
+            the component re-triggers its own re-render (a visible repaint
+            of the clip) and, since video_in.change() clears the other
+            output panels, a redundant repaint of those too -- on top of
+            the one .change() already does for the genuine new-clip event."""
             if video:
                 max_dur = (MAX_DURATION_WEBCAM_S if source == "webcam"
                            else MAX_DURATION_S)
@@ -1275,28 +1474,28 @@ def launch_ui(reader: LipReader, example_paths=None,
                     err = _duration_error(video, max_dur)
                 except Exception:
                     logging.exception(f"Could not read clip {video}")
-                    gr.Warning("This video could not be read; please try a "
-                               "different file or recording.")
-                    return None, source
+                    return (None, source, "This video could not be read; "
+                            "please try a different file or recording.")
                 if err:
-                    gr.Warning(err)
-                    return None, source
-            return video, source
+                    return None, source, err
+            return gr.update(), source, ""
 
         video_in.upload(
             lambda v: check_length(v, "upload"),
-            inputs=[video_in], outputs=[video_in, source_state],
+            inputs=[video_in], outputs=[video_in, source_state, status_msg],
         )
         video_in.stop_recording(
             lambda v: check_length(v, "webcam"),
-            inputs=[video_in], outputs=[video_in, source_state],
+            inputs=[video_in], outputs=[video_in, source_state, status_msg],
         )
         # Fires on any new value (upload, webcam recording, example click)
         # and on clearing: Submit is usable exactly when a clip is loaded,
         # and results from the previous clip are cleared.
         def on_clip_change(video):
+            loaded = video is not None
             return (
-                gr.update(interactive=video is not None),
+                gr.update(interactive=loaded),
+                gr.update(interactive=loaded),  # "Try another clip"
                 "",    # recognised text
                 None,  # word confidence
                 None,  # ROI video
@@ -1305,8 +1504,13 @@ def launch_ui(reader: LipReader, example_paths=None,
 
         video_in.change(
             on_clip_change, inputs=[video_in],
-            outputs=[submit, text_out, conf_out, roi_vid, strip_out],
+            outputs=[submit, new_clip, text_out, conf_out, roi_vid,
+                     strip_out],
         )
+        # Clearing the input brings back the upload/record chooser; the
+        # change handler above then resets Submit and wipes the old results.
+        # The status message is not one of its outputs, so clear it here.
+        new_clip.click(lambda: (None, ""), outputs=[video_in, status_msg])
         # Changing the degradation makes re-submitting the same clip a new
         # experiment, so it re-enables Submit (if a clip is loaded).
         for slider in (noise_sl, blur_sl):
@@ -1318,7 +1522,28 @@ def launch_ui(reader: LipReader, example_paths=None,
             infer,
             inputs=[video_in, source_state, noise_sl, blur_sl],
             outputs=[text_out, conf_out, roi_vid, strip_out,
-                     submit, video_in],
+                     submit, video_in, status_msg],
+        ).then(
+            # Bring the result to the user instead of making them scroll and
+            # guess: on a phone the results column sits below the entire
+            # input column, so a finished prediction lands off-screen.
+            # Client-side only (fn=None); gradio's own scroll_to_output is no
+            # use here because it targets the topmost output component, which
+            # is the video input itself. Skipped when there is no prediction
+            # to show (rejected clip, quota, out-of-domain) and when the
+            # results are already on screen (the desktop side-by-side layout).
+            None, None, None,
+            js="""() => {
+              setTimeout(() => {
+                const col = document.getElementById('results-col');
+                const txt = document.querySelector(
+                  '.rec-text textarea, .rec-text input');
+                if (!col || !txt || !txt.value.trim()) return;
+                const top = col.getBoundingClientRect().top;
+                if (top >= 0 && top < window.innerHeight * 0.5) return;
+                col.scrollIntoView({behavior: 'smooth', block: 'start'});
+              }, 150);
+            }""",
         )
     # One GPU inference at a time with a bounded waiting line (visitors see
     # their queue position); protects the server when the demo is public.
@@ -1353,10 +1578,28 @@ def get_args() -> argparse.Namespace:
                    help="dlib 68-point landmark model.")
     p.add_argument("--layer", type=int, default=9,
                    help="AV-HuBERT encoder output layer (must match training).")
+    p.add_argument("--roi-mode", choices=["centroid", "meanface"],
+                   default="centroid",
+                   help="Mouth-ROI geometry. 'centroid': crop around the mouth "
+                        "centre, scaled by measured head size (--normalize-head). "
+                        "'meanface': warp each frame onto a reference face "
+                        "first (AV-HuBERT's own preprocessing), which also "
+                        "corrects pose and in-plane rotation. MUST match the "
+                        "geometry --checkpoint was trained on. "
+                        "Default: %(default)s")
+    p.add_argument("--mean-face", type=Path,
+                   default=Path("download/20words_mean_face.npy"),
+                   help="Reference landmarks for --roi-mode meanface. "
+                        "Default: %(default)s")
     p.add_argument("--normalize-head", type=str2bool, default=True,
                    help="Scale the mouth crop to the detected face size (IOD) so "
                         "the mouth-to-head ratio matches GRID for arbitrary "
                         "videos. No-op for GRID-sized faces. Default: %(default)s")
+    p.add_argument("--word-conf-calibration", type=Path, default=None,
+                   help="Isotonic word-confidence map fitted for THIS "
+                        "checkpoint. The map is model-specific: pairing it "
+                        "with a different model silently reports wrong "
+                        "confidences. Defaults to the BPE-58 map.")
     p.add_argument("--mediapipe-fallback", type=str2bool, default=True,
                    help="When dlib's HOG detector finds no face in a frame, "
                         "fall back to MediaPipe face detection (fast, robust "
@@ -1367,10 +1610,15 @@ def get_args() -> argparse.Namespace:
     p.add_argument("--num-decoder-layers", type=int, default=3)
     p.add_argument("--ui", action="store_true",
                    help="Launch the Gradio web UI instead of CLI.")
-    p.add_argument("--max-per-hour", type=int, default=5,
+    p.add_argument("--idle-offload-seconds", type=int, default=300,
+                   help="Move the models off the GPU to CPU after this many "
+                        "seconds with no request, freeing GPU memory; the next "
+                        "request restores them (<1 s). 0 disables. Ignored "
+                        "without a CUDA device. Default: %(default)s")
+    p.add_argument("--max-per-hour", type=int, default=10,
                    help="UI quota: videos (uploaded or recorded) allowed "
                         "per visitor (IP) per hour.")
-    p.add_argument("--max-per-day", type=int, default=15,
+    p.add_argument("--max-per-day", type=int, default=30,
                    help="UI quota: videos (uploaded or recorded) allowed "
                         "per visitor (IP) per day.")
     p.add_argument("--activity-log", type=Path,
@@ -1379,15 +1627,26 @@ def get_args() -> argparse.Namespace:
                         "(timestamp, upload/webcam, confidence numbers only; "
                         "no content, no IP). Pass '' to disable.")
     p.add_argument("--examples", type=Path, nargs="*",
-                   default=[Path("grid-corpus/s1/bbaf2n.mpg"),
-                            Path("grid-corpus/s2/sgbp4s.mpg"),
-                            Path("grid-corpus/s20/pgwj3p.mpg"),
-                            Path("grid-corpus/s22/srwaza.mpg"),
-                            Path("s3_l_lgin3a.mov")],
+                   default=[Path("download/grid-corpus/s1/bbaf2n.mpg"),
+                            Path("download/grid-corpus/s2/sgbp4s.mpg"),
+                            Path("download/grid-corpus/s20/pgwj3p.mpg"),
+                            Path("download/grid-corpus/s22/srwaza.mpg"),
+                            Path("s3_l_lgin3a.mov"),
+                            Path("recorded_demo_lgwf8a.mp4")],
                    help="Example clips offered in the UI (missing files are "
                         "skipped). Pass no paths to disable.")
     p.add_argument("video", nargs="?", default=None,
                    help="Video path (CLI mode; omit when using --ui).")
+    p.add_argument("--noise", type=float, nargs="+", default=None,
+                   help="Gaussian noise sigma(s) applied to the mouth ROI "
+                        "before recognition (matches the UI slider, 0-50). "
+                        "Multiple values re-run the same video once per "
+                        "value, reusing the loaded model -- a noise/blur "
+                        "robustness sweep. Paired index-wise with --blur.")
+    p.add_argument("--blur", type=float, nargs="+", default=None,
+                   help="Gaussian blur sigma(s) applied to the mouth ROI "
+                        "before recognition (matches the UI slider, 0-5). "
+                        "Same broadcasting/pairing rule as --noise.")
     return p.parse_args()
 
 
@@ -1406,15 +1665,26 @@ def main():
     else:
         if args.video is None:
             raise SystemExit("Provide a video path, or pass --ui for the web UI.")
-        text, _, word_confs, ood = reader.recognize(args.video)
-        if ood == "hide":
-            print("[out-of-domain] not a GRID sentence; no result shown")
-        else:
-            print(text)
-            if word_confs:
-                print(" ".join(f"{w}({c:.2f})" for w, c in word_confs))
-            if ood == "warn":
-                print("[warning] may not be a GRID sentence")
+        noise = args.noise or [0.0]
+        blur = args.blur or [0.0]
+        n = max(len(noise), len(blur))
+        if len(noise) == 1 and n > 1:
+            noise = noise * n
+        if len(blur) == 1 and n > 1:
+            blur = blur * n
+        if len(noise) != len(blur):
+            raise SystemExit("--noise/--blur must have matching lengths "
+                              "(or a single value to broadcast)")
+        for n_sigma, b_sigma in zip(noise, blur):
+            text, _, word_confs, ood = reader.recognize(
+                args.video, noise_sigma=n_sigma, blur_sigma=b_sigma)
+            tag = f"[noise={n_sigma:g} blur={b_sigma:g}]"
+            if ood == "hide":
+                print(f"{tag} [out-of-domain] not a GRID sentence; no result shown")
+            else:
+                print(f"{tag} {text}")
+                if word_confs:
+                    print(" ".join(f"{w}({c:.2f})" for w, c in word_confs))
 
 
 if __name__ == "__main__":
