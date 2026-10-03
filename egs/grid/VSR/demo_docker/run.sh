@@ -15,6 +15,16 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."  # egs/grid/VSR
 
+# Serving the mean-face / phone-lexicon / layer-8 system since 2026-08-16
+# (was: centroid ROIs, BPE-58, layer 9, conformer_ctc2/exp32). It is ~0.7 pts
+# worse on GRID and ~5 pts better cross-corpus (8.40% vs 13.38% on Lombard
+# GRID), which is the trade we want for arbitrary webcam input.
+#
+# Three settings must move together or accuracy degrades silently rather than
+# erroring: --roi-mode meanface, --layer 8, and the phone lexicon/HLG. The
+# word-confidence calibration is fitted per model too -- the default map
+# belongs to the BPE system. Previous launch line kept in run.sh.bpe-backup.
+
 docker build -q -t vsr-demo demo_docker
 
 docker network inspect vsr-net >/dev/null 2>&1 || \
@@ -34,11 +44,14 @@ docker run -d --restart unless-stopped --name vsr-demo \
     -v "$PWD/demo_saved:/data/icefall/egs/grid/VSR/demo_saved" \
     vsr-demo \
     python conformer_ctc2/demo.py --ui \
-        --checkpoint conformer_ctc2/exp32/pretrained.pt \
-        --tokens data/lang_bpe_58/tokens.txt \
+        --checkpoint conformer_ctc2/exp-phone-l8/pretrained.pt \
+        --roi-mode meanface \
+        --layer 8 \
+        --tokens data/lang_phone/tokens_model.txt \
         --method 1best \
-        --HLG data/lang_bpe_58/HLG.pt \
-        --words-file data/lang_bpe_58/words.txt \
+        --HLG data/lang_phone/HLG.pt \
+        --words-file data/lang_phone/words.txt \
+        --word-conf-calibration conformer_ctc2/word_conf_isotonic_calibration_phone_l8.npz \
         --avhubert-ckpt download/avhubert-ckpts/base_vox_iter5.pt \
         "$@"
 
