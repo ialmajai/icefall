@@ -25,7 +25,6 @@ import dlib
 import numpy as np
 import torch
 import torch.multiprocessing as mp
-import torch.nn.functional as F
 from fairseq import checkpoint_utils
 from lhotse import CutSet, LilcomChunkyWriter, NumpyHdf5Writer
 from lhotse.features.io import KaldiWriter
@@ -111,14 +110,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--storage",
         choices=["hdf5", "lilcom", "kaldi8"],
-        default="kaldi8",
-        help="Feature storage. 'kaldi8': Kaldi ark with 8-bit per-column "
-        "compression (KaldiWriter, compression_method=2), a quarter of "
-        "float32 (2.0 against 7.1 GB for GRID layer 8); the recipe trained "
-        "and decoded on it matches uncompressed features (three seeds). "
-        "'hdf5': uncompressed (NumpyHdf5Writer). 'lilcom': lossy lilcom "
-        "compression (LilcomChunkyWriter, as icefall uses for fbank), "
-        "about 10%% larger than kaldi8. Default: %(default)s",
+        default="lilcom",
+        help="Feature storage. 'lilcom': lossy lilcom compression "
+        "(LilcomChunkyWriter, icefall's usual feature storage), under a "
+        "third of float32; the released head decodes the GRID test set "
+        "from it to identical hypotheses. 'kaldi8': Kaldi ark with 8-bit "
+        "per-column compression (KaldiWriter, compression_method=2), about "
+        "10%% smaller than lilcom; needs kaldi_native_io. 'hdf5': "
+        "uncompressed (NumpyHdf5Writer). Default: %(default)s",
     )
     parser.add_argument(
         "--batch-size",
@@ -565,7 +564,7 @@ def _worker_init(args: argparse.Namespace) -> None:
         getattr(args, "feature_dtype", "float32")
     )
     _worker_globals["batch_size"] = getattr(args, "batch_size", 1)
-    _worker_globals["storage"] = getattr(args, "storage", "kaldi8")
+    _worker_globals["storage"] = getattr(args, "storage", "lilcom")
     _worker_globals["autocast"] = getattr(args, "autocast", False)
     _worker_globals["mouth_w"] = getattr(args, "mouth_w", 64)
     _worker_globals["mouth_h"] = getattr(args, "mouth_h", 64)
@@ -736,7 +735,8 @@ def process_worker(args: tuple) -> list:
         flush(writer)
 
     logging.info(
-        f"Worker {worker_id} finished, wrote {len(video_cuts)} cuts to {stem} ({storage})"
+        f"Worker {worker_id} finished, wrote {len(video_cuts)} cuts to {stem} "
+        f"({storage})"
     )
     return video_cuts
 
@@ -811,7 +811,8 @@ def compute_avhubert_grid():
         cut_set.to_file(feats_dir / f"grid_cuts_{partition}.jsonl.gz")
 
         logging.info(
-            f"Done {partition} → {len(all_cuts)} cuts, stored in {args.n_workers} {args.storage} files"
+            f"Done {partition} → {len(all_cuts)} cuts, stored in "
+            f"{args.n_workers} {args.storage} files"
         )
 
 
